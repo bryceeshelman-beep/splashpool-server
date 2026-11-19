@@ -50,6 +50,12 @@ export class StratumV1Client {
     private stratumInitialized = false;
     private usedSuggestedDifficulty = false;
     private sessionDifficulty: number = 100000;
+    private minDifficultyCache: number;
+    // Splash Pool reject limit: per-connection counts for the current minute.
+    private rejectWindowStart = 0;
+    private rejectWindowAccepted = 0;
+    private rejectWindowRejected = 0;
+    private static rejectKickLog = { nextLogAt: 0, suppressed: 0 };
 
     private entity: ClientEntity;
     private creatingEntity: Promise<void>;
@@ -285,7 +291,7 @@ export class StratumV1Client {
                 if (errors.length === 0) {
 
                     this.clientSuggestedDifficulty = suggestDifficultyMessage;
-                    this.sessionDifficulty = suggestDifficultyMessage.suggestedDifficulty;
+                    this.sessionDifficulty = this.clampDifficulty(suggestDifficultyMessage.suggestedDifficulty);
                     const success = await this.write(JSON.stringify(this.clientSuggestedDifficulty.response(this.sessionDifficulty)) + '\n');
                     if (!success) {
                         return;
@@ -385,6 +391,7 @@ export class StratumV1Client {
                 this.sessionDifficulty = 0.1;
             }
         }
+        this.sessionDifficulty = this.clampDifficulty(this.sessionDifficulty);
 
         if (this.clientSuggestedDifficulty == null) {
             //console.log(`Setting difficulty to ${this.sessionDifficulty}`)
@@ -514,6 +521,9 @@ export class StratumV1Client {
                 submission.id,
                 eStratumErrorCode.JobNotFound,
                 'Job not found').response();
+            if (this.noteShareResult(false)) {
+                return false;
+            }
             //console.log(err);
             const success = await this.write(err);
             if (!success) {
@@ -528,6 +538,9 @@ export class StratumV1Client {
                 submission.id,
                 eStratumErrorCode.JobNotFound,
                 'Job Template not found').response();
+            if (this.noteShareResult(false)) {
+                return false;
+            }
             //console.log(err);
             const success = await this.write(err);
             if (!success) {
@@ -548,6 +561,9 @@ export class StratumV1Client {
                 submission.id,
                 eStratumErrorCode.DuplicateShare,
                 'Duplicate share').response();
+            if (this.noteShareResult(false)) {
+                return false;
+            }
             const success = await this.write(err);
             if (!success) {
                 return false;
@@ -557,7 +573,7 @@ export class StratumV1Client {
             this.miningSubmissionHashes.add(submissionHash);
         }
 
-        const versionMask = parseInt(submission.versionMask, 16);
+        let versionMask = parseInt(submission.versionMask, 16);
         const nonce = parseInt(submission.nonce, 16);
         const timestamp = parseInt(submission.ntime, 16);
 
@@ -569,12 +585,39 @@ export class StratumV1Client {
             submission.extraNonce2,
             timestamp
         );
-        const { submissionDifficulty } = this.calculateDifficulty(header);
+        let { submissionDifficulty } = this.calculateDifficulty(header);
+
+        // Splash Pool: firmware disagrees on what the submitted version bits mean.
+        // Bitaxe-style firmware sends only the bits it flipped (XOR, above); BIP310
+        // firmware (e.g. the Hammer) sends the full rolled bits. The two only differ
+        // when the template version already has a bit inside the rolling mask, as
+        // in any soft-fork signalling period. Try the BIP310 reading, expressed as
+        // the equivalent XOR mask, before calling the share low.
+        if (submissionDifficulty < this.sessionDifficulty && versionMask) {
+            const bip310Mask = bip310XorMask(jobTemplate.block.version, versionMask);
+            if (bip310Mask !== versionMask) {
+                const alt = this.calculateDifficulty(job.buildHeaderBuffer(
+                    jobTemplate,
+                    bip310Mask,
+                    nonce,
+                    this.extraNonceAndSessionId,
+                    submission.extraNonce2,
+                    timestamp
+                )).submissionDifficulty;
+                if (alt > submissionDifficulty) {
+                    submissionDifficulty = alt;
+                    versionMask = bip310Mask;
+                }
+            }
+        }
 
         //console.log(`DIFF: ${submissionDifficulty} of ${this.sessionDifficulty} from ${this.clientAuthorization.worker + '.' + this.extraNonceAndSessionId}`);
 
 
-        if (submissionDifficulty >= this.sessionDifficulty) {
+        // A block solution is always accepted, even below the session difficulty
+        // (possible on test networks, where blocks can be easier than the floor).
+        if (submissionDifficulty >= this.sessionDifficulty || submissionDifficulty >= jobTemplate.blockData.networkDifficulty) {
+            this.noteShareResult(true);
             const success = await this.write(JSON.stringify(submission.response()) + '\n');
             if (!success) {
                 return false;
@@ -649,6 +692,9 @@ export class StratumV1Client {
                 submission.id,
                 eStratumErrorCode.LowDifficultyShare,
                 'Difficulty too low').response();
+            if (this.noteShareResult(false)) {
+                return false;
+            }
 
             const success = await this.write(err);
             if (!success) {
@@ -663,11 +709,42 @@ export class StratumV1Client {
 
     }
 
+    /**
+     * Splash Pool: lowest share difficulty a connection may have, so nobody can
+     * flood the pool with trivially easy shares via suggest_difficulty or by
+     * idling until vardiff decays. SPLASH_MIN_DIFFICULTY sets it; unset, it is
+     * 512 on mainnet (a ~400 GH/s Bitaxe still gets a share every ~5 s) and off
+     * elsewhere.
+     */
+    private get minDifficulty(): number {
+        if (this.minDifficultyCache == null) {
+            const raw = this.configService.get('SPLASH_MIN_DIFFICULTY');
+            const parsed = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw);
+            if (Number.isFinite(parsed) && parsed >= 0) {
+                this.minDifficultyCache = parsed;
+            } else {
+                if (raw != null && `${raw}`.trim() !== '') {
+                    console.warn(`Ignoring invalid SPLASH_MIN_DIFFICULTY=${raw}`);
+                }
+                this.minDifficultyCache = this.configService.get('NETWORK') === 'mainnet' ? 512 : 0;
+            }
+        }
+        return this.minDifficultyCache;
+    }
+
+    private clampDifficulty(difficulty: number): number {
+        if (!Number.isFinite(difficulty)) {
+            return Math.max(100000, this.minDifficulty);
+        }
+        return Math.max(difficulty, this.minDifficulty);
+    }
+
     private async checkDifficulty() {
-        const targetDiff = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
-        if (targetDiff == null) {
+        const suggested = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
+        if (suggested == null) {
             return;
         }
+        const targetDiff = this.clampDifficulty(suggested);
 
         if (targetDiff != this.sessionDifficulty) {
             //console.log(`Adjusting ${this.extraNonceAndSessionId} difficulty from ${this.sessionDifficulty} to ${targetDiff}`);
@@ -800,6 +877,54 @@ export class StratumV1Client {
         return ` sample=${values.join(',')}`;
     }
 
+    /**
+     * Splash Pool reject limit. Counts accepted and rejected shares per minute and
+     * disconnects a connection whose rejects reach SPLASH_REJECT_LIMIT (default 200)
+     * and SPLASH_REJECT_RATIO (default 0.9) of its submissions in that minute, so
+     * nobody can burn pool CPU with junk shares. A healthy miner never gets close:
+     * vardiff aims for a share every few seconds, and stale rejects after a new
+     * block or difficulty change are a small fraction. SPLASH_REJECT_LIMIT=0 turns
+     * it off. Returns true if the connection was closed.
+     */
+    private noteShareResult(accepted: boolean): boolean {
+        const now = Date.now();
+        if (now - this.rejectWindowStart >= 60_000) {
+            this.rejectWindowStart = now;
+            this.rejectWindowAccepted = 0;
+            this.rejectWindowRejected = 0;
+        }
+        if (accepted) {
+            this.rejectWindowAccepted++;
+            return false;
+        }
+        this.rejectWindowRejected++;
+        const limit = this.configNumber('SPLASH_REJECT_LIMIT', 200);
+        if (limit <= 0 || this.rejectWindowRejected < limit) {
+            return false;
+        }
+        const ratio = this.configNumber('SPLASH_REJECT_RATIO', 0.9);
+        const total = this.rejectWindowAccepted + this.rejectWindowRejected;
+        if (this.rejectWindowRejected / total < ratio) {
+            return false;
+        }
+        const log = StratumV1Client.rejectKickLog;
+        if (now >= log.nextLogAt) {
+            console.warn(`Splash: disconnecting ${this.clientAuthorization?.address ?? '?'}.${this.clientAuthorization?.worker ?? '?'} (${this.socket.remoteAddress}): ${this.rejectWindowRejected} rejected / ${total} shares this minute${log.suppressed > 0 ? ` (+${log.suppressed} similar disconnects not logged)` : ''}`);
+            log.nextLogAt = now + 10_000;
+            log.suppressed = 0;
+        } else {
+            log.suppressed++;
+        }
+        this.closeSocket();
+        return true;
+    }
+
+    private configNumber(key: string, fallback: number): number {
+        const raw = this.configService.get(key);
+        const n = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw);
+        return Number.isFinite(n) && n >= 0 ? n : fallback;
+    }
+
     private closeSocket() {
         this.connectionClosed = true;
         if (!this.socket.destroyed) {
@@ -842,4 +967,17 @@ export class StratumV1Client {
         }
     }
 
+}
+
+// The rolling mask the pool offers in mining.configure.
+export const VERSION_ROLLING_MASK = 0x1fffe000;
+
+/**
+ * BIP310: block version = (job version & ~mask) | (submitted bits & mask).
+ * Returned as the XOR mask that turns the job version into that version, so
+ * the existing header/block builders (which XOR) can use it unchanged.
+ */
+export function bip310XorMask(jobVersion: number, submittedBits: number): number {
+    const rolled = ((jobVersion & ~VERSION_ROLLING_MASK) | (submittedBits & VERSION_ROLLING_MASK)) >>> 0;
+    return (jobVersion ^ rolled) >>> 0;
 }

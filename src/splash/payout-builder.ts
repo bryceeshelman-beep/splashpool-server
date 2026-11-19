@@ -8,6 +8,10 @@
 // Miners whose split share is under minPayout are dropped and their portion
 // is spread over the rest (non-custodial: nothing is owed or carried over).
 // At most maxSplitOutputs miners are paid; the smallest are dropped first.
+// With maxOutputBytes, all outputs together (fee, finder, split) must also fit
+// in that many serialized bytes: miner firmware (AxeOS/ESP-Miner and forks)
+// crashes on mining.notify lines much over ~12 KB, and a P2TR output is 43
+// bytes where P2WPKH is 31, so a byte budget is the honest limit.
 // Satoshis lost to rounding go to the finder, so outputs always sum to reward.
 // Outputs paying the same address are merged into one.
 
@@ -25,6 +29,10 @@ export interface IPayoutParams {
     finderBonusSats: number;
     minPayoutSats: number;
     maxSplitOutputs: number;
+    // Optional serialized-size budget for all payout outputs, in bytes.
+    maxOutputBytes?: number;
+    // Serialized size of one output paying `address` (8 value + script length + script).
+    outputBytes?: (address: string) => number;
 }
 
 export interface IPayoutOutput {
@@ -59,7 +67,13 @@ function assertSats(name: string, v: number) {
  * and keeping at most `maxCount` of the largest. Returns floor amounts; the
  * caller assigns the leftover sats.
  */
-export function splitByWork(pool: number, window: IWindowWork[], minPayout: number, maxCount: number): { paid: Map<string, number>, dropped: number } {
+export function splitByWork(
+    pool: number,
+    window: IWindowWork[],
+    minPayout: number,
+    maxCount: number,
+    budget?: { bytes: number, sizeOf: (address: string) => number },
+): { paid: Map<string, number>, dropped: number } {
     // Merge duplicate addresses and ignore non-positive work.
     const work = new Map<string, number>();
     for (const w of window) {
@@ -75,6 +89,16 @@ export function splitByWork(pool: number, window: IWindowWork[], minPayout: numb
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     if (kept.length > maxCount) {
         kept = kept.slice(0, Math.max(0, maxCount));
+    }
+    if (budget) {
+        // Take miners largest-first while their outputs still fit.
+        let used = 0;
+        let fit = 0;
+        while (fit < kept.length && used + budget.sizeOf(kept[fit][0]) <= budget.bytes) {
+            used += budget.sizeOf(kept[fit][0]);
+            fit++;
+        }
+        kept = kept.slice(0, fit);
     }
 
     if (pool <= 0 || kept.length === 0) {
@@ -126,7 +150,25 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
     const finderBonus = Math.min(p.finderBonusSats, p.reward - fee);
     const splitPool = p.reward - fee - finderBonus;
 
-    const { paid, dropped } = splitByWork(splitPool, p.window, Math.max(1, p.minPayoutSats), p.maxSplitOutputs);
+    let budget: { bytes: number, sizeOf: (address: string) => number } = undefined;
+    if (p.maxOutputBytes != null) {
+        if (!p.outputBytes) {
+            throw new Error('maxOutputBytes needs outputBytes');
+        }
+        assertSats('maxOutputBytes', p.maxOutputBytes);
+        // Fee and finder outputs are always present; a miner who is also the
+        // fee or finder address merges into that output and costs nothing.
+        const fixed = new Set([p.finderAddress, ...(fee > 0 ? [p.feeAddress] : [])]);
+        let fixedBytes = 0;
+        for (const a of fixed) {
+            fixedBytes += p.outputBytes(a);
+        }
+        budget = {
+            bytes: Math.max(0, p.maxOutputBytes - fixedBytes),
+            sizeOf: (a: string) => (fixed.has(a) ? 0 : p.outputBytes(a)),
+        };
+    }
+    const { paid, dropped } = splitByWork(splitPool, p.window, Math.max(1, p.minPayoutSats), p.maxSplitOutputs, budget);
     let splitPaid = 0;
     for (const v of paid.values()) {
         splitPaid += v;

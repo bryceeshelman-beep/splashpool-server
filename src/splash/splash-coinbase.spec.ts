@@ -155,7 +155,7 @@ describe('Splash coinbase', () => {
             address: bitcoinjs.payments.p2wsh({ hash: Buffer.alloc(32, i + 1), network: net }).address,
             difficulty: 1000 + i,
         }));
-        const s = await service(miners);
+        const s = await service(miners, { SPLASH_MAX_COINBASE_OUTPUT_BYTES: '100000' });
         const reward = 5_000_000_000;
         const outputs = s.outputsFor(FINDER, reward);
         expect(outputs.length).toBe(252);
@@ -171,11 +171,39 @@ describe('Splash coinbase', () => {
             address: bitcoinjs.payments.p2wsh({ hash: Buffer.alloc(32, i + 1), network: net }).address,
             difficulty: 1000 + i,
         }));
-        const s = await service(miners);
+        const s = await service(miners, { SPLASH_MAX_COINBASE_OUTPUT_BYTES: '100000' });
         const outputs = s.outputsFor(FINDER, 5_000_000_000);
         // A template built with only the default 8,000 WU reserved.
         const tpl = jobTemplate(5_000_000_000, Math.floor((4_000_000 - 8_000) / FILLER_WU));
         expect(() => new MiningJob(config({}), net, '1', outputs, tpl)).toThrow(/exceeds 4000000/);
+    });
+
+    it('keeps the default coinbase small enough for AxeOS/OSM firmware', async () => {
+        // 250 taproot-sized miners would be ~11 KB of outputs; firmware crashed at ~6.4 KB.
+        const miners = Array.from({ length: 250 }, (_, i) => ({
+            address: bitcoinjs.payments.p2wsh({ hash: Buffer.alloc(32, i + 1), network: net }).address,
+            difficulty: 1000 + i,
+        }));
+        const s = await service(miners);
+        const outputs = s.outputsFor(FINDER, 5_000_000_000);
+        const bytes = outputs.reduce((n, o) => n + s.outputBytes(o.address), 0);
+        expect(bytes).toBeLessThanOrEqual(5000);
+        expect(outputs.length).toBe(2 + Math.floor((5000 - 62) / 43));
+        const job = new MiningJob(config({ POOL_IDENTIFIER: 'Splash Pool' }), net, '1', outputs, jobTemplate(5_000_000_000));
+        // coinb2 in mining.notify; 12,142 hex chars ran fine on both firmwares, 13,002 crashed them.
+        expect((job as any).coinbasePart2.length).toBeLessThan(10_400);
+        // The largest miners are the ones kept.
+        expect(outputs.some(o => o.address === miners[249].address)).toBe(true);
+        expect(outputs.some(o => o.address === miners[0].address)).toBe(false);
+    });
+
+    it('sizes outputs by address type', async () => {
+        const s = await service([]);
+        expect(s.outputBytes(ADDR.p2wpkh)).toBe(31);
+        expect(s.outputBytes(ADDR.p2tr)).toBe(43);
+        expect(s.outputBytes(ADDR.p2wsh)).toBe(43);
+        expect(s.outputBytes(ADDR.p2pkh)).toBe(34);
+        expect(s.outputBytes(ADDR.p2sh)).toBe(32);
     });
 
     it('refuses exact outputs that do not sum to the reward', () => {

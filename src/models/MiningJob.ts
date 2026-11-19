@@ -8,6 +8,25 @@ import { ConfigService } from '@nestjs/config';
 import { TOTAL_EXTRANONCE_SIZE_BYTES } from './stratum.constants';
 
 const MAX_BLOCK_WEIGHT = 4000000;
+
+// Splash Pool: per-miner job building must stay cheap, because every miner gets
+// its own coinbase on every new block. These caches hold work that is the same
+// for everyone: an address's output script, and a template's block weight
+// (keyed by its transactions array, which refreshed copies of a template share).
+const scriptCache = new Map<string, Buffer>();
+const templateWeightCache = new WeakMap<object, number>();
+function templateWeight(block: bitcoinjs.Block): number {
+    const key = block.transactions as object;
+    if (key == null) {
+        return block.weight();
+    }
+    let w = templateWeightCache.get(key);
+    if (w == null) {
+        w = block.weight();
+        templateWeightCache.set(key, w);
+    }
+    return w;
+}
 const MAX_SCRIPT_SIZE = 100; //   https://github.com/bitcoin/bitcoin/blob/ffdc3d6060f6e65e69cf115a13b83e6eb4a0a0a8/src/consensus/tx_check.cpp#L49
 interface AddressObject {
     address: string;
@@ -80,15 +99,15 @@ export class MiningJob {
         this.coinbaseTransaction.addOutput(bitcoinjs.script.compile([bitcoinjs.opcodes.OP_RETURN, Buffer.concat([segwitMagicBits, jobTemplate.block.witnessCommit])]), 0);
 
         // Check if the pool identifier is too long
-        if ((this.coinbaseTransaction.weight() + jobTemplate.block.weight()) > MAX_BLOCK_WEIGHT) {
+        if ((this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)) > MAX_BLOCK_WEIGHT) {
             console.warn('Block weight exceeds the maximum allowed weight, removing the pool identifier');
             let script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, padding]);
             this.coinbaseTransaction.ins[0].script = script;
         }
         // Splash Pool: a large payout coinbase must still fit. Refuse the job
         // rather than hand out work for a block the network would reject.
-        if ((this.coinbaseTransaction.weight() + jobTemplate.block.weight()) > MAX_BLOCK_WEIGHT) {
-            throw new Error(`Block weight ${this.coinbaseTransaction.weight() + jobTemplate.block.weight()} exceeds ${MAX_BLOCK_WEIGHT} with ${this.coinbaseTransaction.outs.length} coinbase outputs`);
+        if ((this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)) > MAX_BLOCK_WEIGHT) {
+            throw new Error(`Block weight ${this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)} exceeds ${MAX_BLOCK_WEIGHT} with ${this.coinbaseTransaction.outs.length} coinbase outputs`);
         }
 
         // get the non-witness coinbase tx
@@ -229,6 +248,19 @@ export class MiningJob {
     }
 
     private getPaymentScript(address: string): Buffer {
+        const key = `${this.network.bech32}|${address}`;
+        let script = scriptCache.get(key);
+        if (script == null) {
+            script = this.buildPaymentScript(address);
+            if (scriptCache.size > 100_000) {
+                scriptCache.clear();
+            }
+            scriptCache.set(key, script);
+        }
+        return script;
+    }
+
+    private buildPaymentScript(address: string): Buffer {
         const addressInfo = getAddressInfo(address);
         switch (addressInfo.type) {
             case AddressType.p2wpkh: {

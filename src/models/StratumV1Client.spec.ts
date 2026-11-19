@@ -642,4 +642,167 @@ describe('StratumV1Client', () => {
 
 
 
+
+    describe('Splash minimum difficulty', () => {
+        const withConfig = (extra: Record<string, string>) => {
+            (configService.get as jest.Mock).mockImplementation((key: string) => {
+                if (key in extra) {
+                    return extra[key];
+                }
+                switch (key) {
+                    case 'DEV_FEE_ADDRESS':
+                        return 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4';
+                    case 'NETWORK':
+                        return 'testnet';
+                }
+                return null;
+            });
+            (client as any).minDifficultyCache = undefined;
+        };
+
+        it('raises a too-low suggest_difficulty to the floor', async () => {
+            withConfig({ SPLASH_MIN_DIFFICULTY: '512' });
+            jest.spyOn(socket, 'write').mockImplementation((data) => true);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0.00001]}`);
+            await new Promise((r) => setTimeout(r, 1));
+            expect((client as any).sessionDifficulty).toBe(512);
+            expect(socket.write).toHaveBeenCalledWith(`{"id":null,"method":"mining.set_difficulty","params":[512]}\n`, expect.any(Function));
+        });
+
+        it('keeps a suggestion above the floor', async () => {
+            withConfig({ SPLASH_MIN_DIFFICULTY: '512' });
+            jest.spyOn(socket, 'write').mockImplementation((data) => true);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [4096]}`);
+            await new Promise((r) => setTimeout(r, 1));
+            expect((client as any).sessionDifficulty).toBe(4096);
+        });
+
+        it('defaults to 512 on mainnet and off elsewhere; ignores invalid values', () => {
+            withConfig({ NETWORK: 'mainnet' });
+            expect((client as any).minDifficulty).toBe(512);
+            withConfig({});
+            expect((client as any).minDifficulty).toBe(0);
+            withConfig({ NETWORK: 'mainnet', SPLASH_MIN_DIFFICULTY: 'abc' });
+            expect((client as any).minDifficulty).toBe(512);
+            withConfig({ NETWORK: 'mainnet', SPLASH_MIN_DIFFICULTY: '0' });
+            expect((client as any).minDifficulty).toBe(0);
+        });
+
+        it('does not let vardiff decay below the floor', async () => {
+            withConfig({ SPLASH_MIN_DIFFICULTY: '512' });
+            jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+            const socketWrite = jest.spyOn(socket, 'write').mockImplementation((data) => true);
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [512]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(0.5);
+            socketWrite.mockClear();
+            await (client as any).checkDifficulty();
+            expect((client as any).sessionDifficulty).toBe(512);
+            expect(socketWrite).not.toHaveBeenCalledWith(expect.stringContaining('set_difficulty'));
+        });
+
+        it('accepts a block solution below the session difficulty', async () => {
+            jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+            const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+            jest.spyOn(addressSettings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [${Number.MAX_SAFE_INTEGER}]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+            jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+                submissionDifficulty: Number.MAX_SAFE_INTEGER - 1,
+                submissionHash: 'block-share'
+            });
+            emitMessage(MockRecording1.MINING_SUBMIT);
+            jest.useRealTimers();
+            await new Promise((r) => setTimeout(r, 1000));
+            expect((client as any).sessionDifficulty).toBe(Number.MAX_SAFE_INTEGER);
+            expect(bitcoinRpcService.SUBMIT_BLOCK).toHaveBeenCalled();
+            expect((client as any).write).lastCalledWith(`{"id":5,"error":null,"result":true}\n`);
+        });
+    });
+
+
+    describe('Splash reject limit', () => {
+        const withConfig = (extra: Record<string, string>) => {
+            (configService.get as jest.Mock).mockImplementation((key: string) => {
+                if (key in extra) {
+                    return extra[key];
+                }
+                switch (key) {
+                    case 'DEV_FEE_ADDRESS':
+                        return 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4';
+                    case 'NETWORK':
+                        return 'testnet';
+                }
+                return null;
+            });
+        };
+        const note = (accepted: boolean, n: number) => {
+            let closed = false;
+            for (let i = 0; i < n; i++) {
+                closed = (client as any).noteShareResult(accepted) || closed;
+            }
+            return closed;
+        };
+
+        beforeEach(() => {
+            jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+            (StratumV1Client as any).rejectKickLog.nextLogAt = 0;
+        });
+
+        it('disconnects at 200 rejects when nearly everything is rejected', () => {
+            withConfig({});
+            expect(note(false, 199)).toBe(false);
+            expect(socket.destroy).not.toHaveBeenCalled();
+            expect(note(false, 1)).toBe(true);
+            expect(socket.destroy).toHaveBeenCalled();
+        });
+
+        it('keeps a connection whose rejects are a minority', () => {
+            withConfig({});
+            note(true, 1000);
+            expect(note(false, 300)).toBe(false);
+            expect(socket.destroy).not.toHaveBeenCalled();
+        });
+
+        it('starts counting again each minute', () => {
+            withConfig({});
+            const now = jest.spyOn(Date, 'now');
+            now.mockReturnValue(1_000_000);
+            note(false, 150);
+            now.mockReturnValue(1_000_000 + 60_000);
+            expect(note(false, 150)).toBe(false);
+            expect(socket.destroy).not.toHaveBeenCalled();
+            now.mockRestore();
+        });
+
+        it('honours SPLASH_REJECT_LIMIT and SPLASH_REJECT_RATIO; 0 turns it off', () => {
+            withConfig({ SPLASH_REJECT_LIMIT: '0' });
+            expect(note(false, 5000)).toBe(false);
+            (client as any).rejectWindowStart = 0;
+            withConfig({ SPLASH_REJECT_LIMIT: '10', SPLASH_REJECT_RATIO: '0.5' });
+            note(true, 10);
+            expect(note(false, 10)).toBe(true);
+        });
+
+        it('disconnects a client that floods duplicate shares', async () => {
+            withConfig({});
+            jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+            for (let i = 0; i < 201; i++) {
+                emitMessage(MockRecording1.MINING_SUBMIT);
+            }
+            jest.useRealTimers();
+            await new Promise((r) => setTimeout(r, 1500));
+            expect(socket.destroy).toHaveBeenCalled();
+            expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('200 rejected / 201 shares'));
+        });
+    });
+
 });

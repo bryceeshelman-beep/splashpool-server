@@ -180,6 +180,42 @@ describe('buildPayouts', () => {
     });
 });
 
+describe('output byte budget', () => {
+    // Pretend sizes: names starting with T are taproot (43 B), others P2WPKH (31 B).
+    const size = (a: string) => 8 + 1 + (a.startsWith('T') ? 34 : 22);
+    const window = Array.from({ length: 50 }, (_, i) => ({ address: `${i % 2 ? 'T' : 'W'}${i}`, difficulty: 1000 - i }));
+
+    it('pays the largest miners that fit, counting fee and finder outputs', () => {
+        const r = buildPayouts(base({ window, maxOutputBytes: 31 * 2 + 31 + 43 + 31, outputBytes: size }));
+        // fee + finder use 62 of 167 bytes: W0 (31), T1 (43), W2 (31) fit exactly.
+        expect(r.outputs.map(o => o.address)).toEqual(['FEE', 'FINDER', 'W0', 'T1', 'W2']);
+        expect(r.outputs.reduce((n, o) => n + size(o.address), 0)).toBeLessThanOrEqual(167);
+        expect(sum(r)).toBe(r.reward);
+    });
+
+    it('does not charge the finder or fee address again when they also mine', () => {
+        const r = buildPayouts(base({ window, finderAddress: 'W0', maxOutputBytes: 31 * 2 + 43, outputBytes: size }));
+        // W0 merges into the finder output, so T1 still fits.
+        expect(r.outputs.map(o => o.address)).toEqual(['FEE', 'W0', 'T1']);
+    });
+
+    it('keeps every output within the budget across random windows', () => {
+        let seed = 7;
+        const rand = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+        for (let t = 0; t < 200; t++) {
+            const w = Array.from({ length: Math.floor(rand() * 400) }, (_, i) => ({ address: `${rand() < 0.5 ? 'T' : 'W'}${i}`, difficulty: rand() * 1e9 }));
+            const budget = 62 + Math.floor(rand() * 6000);
+            const r = buildPayouts(base({ window: w, maxOutputBytes: budget, outputBytes: size }));
+            expect(r.outputs.reduce((n, o) => n + size(o.address), 0)).toBeLessThanOrEqual(budget);
+            expect(sum(r)).toBe(r.reward);
+        }
+    });
+
+    it('needs a size function', () => {
+        expect(() => buildPayouts(base({ maxOutputBytes: 100 }))).toThrow(/outputBytes/);
+    });
+});
+
 describe('splitByWork', () => {
     it('returns nothing for an empty pool', () => {
         expect(splitByWork(0, [{ address: 'A', difficulty: 1 }], 1, 10).paid.size).toBe(0);

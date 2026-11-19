@@ -55,6 +55,7 @@ export class PayoutService implements OnModuleInit {
     public readonly finderBonusSats: number;
     public readonly minPayoutSats: number;
     public readonly maxSplitOutputs: number;
+    public readonly maxOutputBytes: number;
     private readonly network: bitcoinjs.networks.Network;
 
     private snapshot: IWindowWork[] = [];
@@ -71,6 +72,10 @@ export class PayoutService implements OnModuleInit {
         this.finderBonusSats = intConfig(this.configService.get('SPLASH_FINDER_BONUS_SATS'), 100_000_000);
         this.minPayoutSats = intConfig(this.configService.get('SPLASH_MIN_PAYOUT_SATS'), 10_000);
         this.maxSplitOutputs = intConfig(this.configService.get('SPLASH_MAX_SPLIT_OUTPUTS'), 250);
+        // AxeOS 2.11 and OSM 2.15 crash between 6,000 and 6,400 bytes of
+        // outputs (tested 2026-11-19); 5,000 leaves room for a full mainnet
+        // block's merkle branch in the same mining.notify line.
+        this.maxOutputBytes = intConfig(this.configService.get('SPLASH_MAX_COINBASE_OUTPUT_BYTES'), 5000);
         this.network = networkFromConfig(this.configService.get('NETWORK'));
 
         if (this.enabled) {
@@ -87,7 +92,7 @@ export class PayoutService implements OnModuleInit {
     async onModuleInit(): Promise<void> {
         if (this.enabled) {
             await this.refresh();
-            console.log(`Splash payouts ON: fee ${this.feeBps / 100}% to ${this.feeAddress}, finder ${this.finderBonusSats} sats, min ${this.minPayoutSats} sats, max ${this.maxSplitOutputs} split outputs, window ${this.shareWindowService.windowHours}h`);
+            console.log(`Splash payouts ON: fee ${this.feeBps / 100}% to ${this.feeAddress}, finder ${this.finderBonusSats} sats, min ${this.minPayoutSats} sats, max ${this.maxSplitOutputs} split outputs / ${this.maxOutputBytes} output bytes, window ${this.shareWindowService.windowHours}h`);
         }
     }
 
@@ -106,8 +111,17 @@ export class PayoutService implements OnModuleInit {
                     console.warn(`Splash: skipping unpayable window address ${m.address}`);
                 }
             }
-            this.snapshot = payable;
+            // Pre-merge and pre-sort in splitByWork's order (largest work first, ties by
+            // address). It merges and sorts again per call, but on sorted input that
+            // is near-linear, which keeps per-miner job building cheap.
+            const merged = new Map<string, number>();
+            for (const m of payable) {
+                merged.set(m.address, (merged.get(m.address) ?? 0) + m.difficulty);
+            }
+            this.snapshot = Array.from(merged, ([address, difficulty]) => ({ address, difficulty }))
+                .sort((a, b) => b.difficulty - a.difficulty || (a.address < b.address ? -1 : a.address > b.address ? 1 : 0));
             this.snapshotAt = new Date();
+            this.outputsCache.clear();
         } catch (e) {
             // Keep the previous snapshot; a stale split is better than none.
             console.error('Splash: share window refresh failed, keeping previous snapshot', e);
@@ -126,12 +140,29 @@ export class PayoutService implements OnModuleInit {
             finderBonusSats: this.finderBonusSats,
             minPayoutSats: this.minPayoutSats,
             maxSplitOutputs: this.maxSplitOutputs,
+            maxOutputBytes: this.maxOutputBytes,
+            outputBytes: (a: string) => this.outputBytes(a),
         });
     }
 
+    // finder|reward -> outputs, valid until the next snapshot. Many workers share one
+    // address, and every one of them needs a job on every new block.
+    private readonly outputsCache = new Map<string, { address: string, value: number }[]>();
+
     /** Exact outputs for MiningJob. */
     public outputsFor(finderAddress: string, reward: number): { address: string, value: number }[] {
-        return this.build(finderAddress, reward).outputs.map(o => ({ address: o.address, value: o.value }));
+        const key = `${finderAddress}|${reward}`;
+        let outputs = this.outputsCache.get(key);
+        if (outputs == null) {
+            outputs = this.build(finderAddress, reward).outputs.map(o => ({ address: o.address, value: o.value }));
+            if (this.outputsCache.size > 50_000) {
+                this.outputsCache.clear();
+            }
+            this.outputsCache.set(key, outputs);
+        } else {
+            this.lastReward = reward;
+        }
+        return outputs.map(o => ({ ...o }));
     }
 
     public status() {
@@ -142,10 +173,27 @@ export class PayoutService implements OnModuleInit {
             finderBonusSats: this.finderBonusSats,
             minPayoutSats: this.minPayoutSats,
             maxSplitOutputs: this.maxSplitOutputs,
+            maxOutputBytes: this.maxOutputBytes,
             snapshotAt: this.snapshotAt?.toISOString() ?? null,
             snapshotMiners: this.snapshot.length,
             lastReward: this.lastReward,
         };
+    }
+
+    private readonly scriptSizes = new Map<string, number>();
+
+    /** Serialized size of an output paying `address`: value, script length, script. */
+    public outputBytes(address: string): number {
+        let n = this.scriptSizes.get(address);
+        if (n == null) {
+            const script = bitcoinjs.address.toOutputScript(address, this.network).length;
+            n = 8 + (script < 253 ? 1 : 3) + script;
+            if (this.scriptSizes.size > 100_000) {
+                this.scriptSizes.clear();
+            }
+            this.scriptSizes.set(address, n);
+        }
+        return n;
     }
 
     public isPayable(address: string): boolean {

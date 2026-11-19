@@ -151,13 +151,10 @@ export class StratumV1ClientStatistics {
         if (val < MIN_DIFF) {
             return MIN_DIFF;
         }
-        let x = val | (val >> 1);
-        x = x | (x >> 2);
-        x = x | (x >> 4);
-        x = x | (x >> 8);
-        x = x | (x >> 16);
-        x = x | (x >> 32);
-        const res = x - (x >> 1);
+        // Largest power of two <= val. The stock code used 32-bit bitwise ops,
+        // which wrap above 2^31 (e.g. 3e9 -> 2.68): a ~1 EH/s connection would
+        // be dropped to a tiny difficulty and flood the pool with shares.
+        const res = val >= 1 ? 2 ** Math.floor(Math.log2(val)) : 0;
         if (res == 0 && val * 100 < MIN_DIFF) {
             return MIN_DIFF;
         }
