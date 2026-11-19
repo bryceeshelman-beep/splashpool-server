@@ -28,6 +28,8 @@ import { EXTRANONCE1_SIZE_BYTES } from './stratum.constants';
 import { SuggestDifficulty } from './stratum-messages/SuggestDifficultyMessage';
 import { StratumV1ClientStatistics } from './StratumV1ClientStatistics';
 import { ExternalSharesService } from '../services/external-shares.service';
+import { ShareWindowService } from '../ORM/share-window/share-window.service';
+import { PayoutService } from '../splash/payout.service';
 
 const TRUE_DIFF_ONE = 2.695953529101131e67;
 const BLOCKED_USER_AGENT_LOG_INTERVAL_MS = 60 * 1000;
@@ -73,7 +75,9 @@ export class StratumV1Client {
         private readonly blocksService: BlocksService,
         private readonly configService: ConfigService,
         private readonly addressSettingsService: AddressSettingsService,
-        private readonly externalSharesService: ExternalSharesService
+        private readonly externalSharesService: ExternalSharesService,
+        private readonly shareWindowService?: ShareWindowService,
+        private readonly payoutService?: PayoutService
     ) {
 
         this.socket.on('data', (data: Buffer) => {
@@ -405,7 +409,14 @@ export class StratumV1Client {
 
         this.backgroundWork.push(
             setInterval(async () => {
-                await this.checkDifficulty();
+                // An error here must not become an unhandled rejection, which
+                // would crash the whole pool. Drop this one miner instead.
+                try {
+                    await this.checkDifficulty();
+                } catch (e) {
+                    console.error(e);
+                    try { await this.socket.end(); } catch { }
+                }
             }, 60 * 1000)
         );
 
@@ -421,7 +432,10 @@ export class StratumV1Client {
             this.hashRate = this.statistics.hashRate;
             this.noFee = this.hashRate != 0 && this.hashRate < 50000000000000;
         }
-        if (this.noFee || devFeeAddress == null || devFeeAddress.length < 1) {
+        if (this.payoutService?.enabled) {
+            // Splash Pool: fee, this miner as finder, and the 3-day window split.
+            payoutInformation = this.payoutService.outputsFor(this.clientAuthorization.address, jobTemplate.blockData.coinbasevalue);
+        } else if (this.noFee || devFeeAddress == null || devFeeAddress.length < 1) {
             payoutInformation = [
                 { address: this.clientAuthorization.address, percent: 100 }
             ];
@@ -565,6 +579,10 @@ export class StratumV1Client {
             if (!success) {
                 return false;
             }
+
+            // Splash Pool: credit this share to the 3-day window before any
+            // block handling, so a block-finding share counts too.
+            this.shareWindowService?.recordShare(this.clientAuthorization.address, this.sessionDifficulty, Date.now(), this.clientAuthorization.worker);
 
             if (submissionDifficulty >= jobTemplate.blockData.networkDifficulty) {
                 console.log('!!! BLOCK FOUND !!!');

@@ -1,3 +1,5 @@
+import { PayoutService } from '../splash/payout.service';
+import { ShareWindowService } from '../ORM/share-window/share-window.service';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'net';
@@ -45,7 +47,9 @@ export class StratumV1Service implements OnModuleInit {
         private readonly configService: ConfigService,
         private readonly stratumV1JobsService: StratumV1JobsService,
         private readonly addressSettingsService: AddressSettingsService,
-        private readonly externalSharesService: ExternalSharesService
+        private readonly externalSharesService: ExternalSharesService,
+        private readonly shareWindowService: ShareWindowService,
+        private readonly payoutService: PayoutService
     ) {
 
     }
@@ -95,7 +99,9 @@ export class StratumV1Service implements OnModuleInit {
                 this.blocksService,
                 this.configService,
                 this.addressSettingsService,
-                this.externalSharesService
+                this.externalSharesService,
+                this.shareWindowService,
+                this.payoutService
             );
 
 

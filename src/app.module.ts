@@ -27,6 +27,9 @@ import { TelegramService } from './services/telegram.service';
 import { ExternalSharesService } from './services/external-shares.service';
 import { ExternalShareController } from './controllers/external-share/external-share.controller';
 import { ExternalSharesModule } from './ORM/external-shares/external-shares.module';
+import { ShareWindowModule } from './ORM/share-window/share-window.module';
+import { SplashModule } from './splash/splash.module';
+import { SplashController } from './controllers/splash/splash.controller';
 
 const ORMModules = [
     ClientStatisticsModule,
@@ -35,7 +38,9 @@ const ORMModules = [
     TelegramSubscriptionsModule,
     BlocksModule,
     RpcBlocksModule,
-    ExternalSharesModule
+    ExternalSharesModule,
+    ShareWindowModule,
+    SplashModule
 ]
 
 @Module({
@@ -60,7 +65,8 @@ const ORMModules = [
         AppController,
         ClientController,
         AddressController,
-        ExternalShareController
+        ExternalShareController,
+        SplashController
     ],
     providers: [
         DiscordService,

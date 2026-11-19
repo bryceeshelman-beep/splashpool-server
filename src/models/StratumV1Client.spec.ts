@@ -50,6 +50,7 @@ describe('StratumV1Client', () => {
     let notificationService: NotificationService;
     let blocksService: BlocksService;
     let externalSharesService;
+    let shareWindowService;
     let configService: ConfigService;
 
     let client: StratumV1Client;
@@ -167,6 +168,9 @@ describe('StratumV1Client', () => {
         externalSharesService = {
             submitShare: jest.fn().mockResolvedValue(undefined)
         };
+        shareWindowService = {
+            recordShare: jest.fn()
+        };
 
 
         client = new StratumV1Client(
@@ -179,7 +183,8 @@ describe('StratumV1Client', () => {
             blocksService,
             configService,
             addressSettings,
-            externalSharesService
+            externalSharesService,
+            shareWindowService
         );
 
         client.extraNonceAndSessionId = MockRecording1.EXTRA_NONCE;
@@ -385,6 +390,13 @@ describe('StratumV1Client', () => {
         await new Promise((r) => setTimeout(r, 1000));
 
         expect((client as any).write).lastCalledWith(`{\"id\":5,\"error\":null,\"result\":true}\n`);
+        expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+        expect(shareWindowService.recordShare).toHaveBeenCalledWith(
+            'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4',
+            (client as any).sessionDifficulty,
+            expect.any(Number),
+            'bitaxe3'
+        );
 
 
     });
@@ -480,6 +492,7 @@ describe('StratumV1Client', () => {
         await new Promise((r) => setTimeout(r, 100));
 
         expect((client as any).write).lastCalledWith(`{"id":5,"result":null,"error":[22,"Duplicate share",""]}\n`);
+        expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
     });
 
     it('should reject submissions for unknown jobs', async () => {
@@ -527,6 +540,7 @@ describe('StratumV1Client', () => {
 
         expect((client as any).write).lastCalledWith(`{"id":5,"result":null,"error":[23,"Difficulty too low",""]}\n`);
         expect(await clientService.connectedClientCount()).toBe(0);
+        expect(shareWindowService.recordShare).not.toHaveBeenCalled();
     });
 
     it('should reject submissions with short extranonce2 values', async () => {

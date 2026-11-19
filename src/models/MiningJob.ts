@@ -13,6 +13,12 @@ interface AddressObject {
     address: string;
     percent: number;
 }
+// Splash Pool: an exact output amount in sats. When every entry has `value`,
+// the outputs must sum to the block reward exactly.
+interface ExactOutput {
+    address: string;
+    value: number;
+}
 export class MiningJob {
 
     private coinbaseTransaction: bitcoinjs.Transaction;
@@ -30,7 +36,7 @@ export class MiningJob {
         configService: ConfigService,
         private network: bitcoinjs.networks.Network,
         public jobId: string,
-        payoutInformation: AddressObject[],
+        payoutInformation: AddressObject[] | ExactOutput[],
         jobTemplate: IJobTemplate
     ) {
 
@@ -78,6 +84,11 @@ export class MiningJob {
             console.warn('Block weight exceeds the maximum allowed weight, removing the pool identifier');
             let script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, padding]);
             this.coinbaseTransaction.ins[0].script = script;
+        }
+        // Splash Pool: a large payout coinbase must still fit. Refuse the job
+        // rather than hand out work for a block the network would reject.
+        if ((this.coinbaseTransaction.weight() + jobTemplate.block.weight()) > MAX_BLOCK_WEIGHT) {
+            throw new Error(`Block weight ${this.coinbaseTransaction.weight() + jobTemplate.block.weight()} exceeds ${MAX_BLOCK_WEIGHT} with ${this.coinbaseTransaction.outs.length} coinbase outputs`);
         }
 
         // get the non-witness coinbase tx
@@ -172,7 +183,7 @@ export class MiningJob {
     }
 
 
-    private createCoinbaseTransaction(addresses: AddressObject[], reward: number): bitcoinjs.Transaction {
+    private createCoinbaseTransaction(addresses: AddressObject[] | ExactOutput[], reward: number): bitcoinjs.Transaction {
         // Part 1
         const coinbaseTransaction = new bitcoinjs.Transaction();
 
@@ -182,17 +193,32 @@ export class MiningJob {
         // Add the coinbase input (input with no previous output)
         coinbaseTransaction.addInput(Buffer.alloc(32, 0), 0xffffffff, 0xffffffff);
 
-        // Add an output
-        let rewardBalance = reward;
+        if (addresses.length > 0 && addresses.every(a => 'value' in a)) {
+            // Splash Pool exact payouts.
+            let total = 0;
+            for (const out of addresses as ExactOutput[]) {
+                if (!Number.isSafeInteger(out.value) || out.value <= 0) {
+                    throw new Error(`Invalid coinbase output value ${out.value} for ${out.address}`);
+                }
+                total += out.value;
+                coinbaseTransaction.addOutput(this.getPaymentScript(out.address), out.value);
+            }
+            if (total !== reward) {
+                throw new Error(`Coinbase outputs sum to ${total}, expected reward ${reward}`);
+            }
+        } else {
+            // Add an output
+            let rewardBalance = reward;
 
-        addresses.forEach(recipientAddress => {
-            const amount = Math.floor((recipientAddress.percent / 100) * reward);
-            rewardBalance -= amount;
-            coinbaseTransaction.addOutput(this.getPaymentScript(recipientAddress.address), amount);
-        })
+            (addresses as AddressObject[]).forEach(recipientAddress => {
+                const amount = Math.floor((recipientAddress.percent / 100) * reward);
+                rewardBalance -= amount;
+                coinbaseTransaction.addOutput(this.getPaymentScript(recipientAddress.address), amount);
+            })
 
-        //Add any remaining sats from the Math.floor
-        coinbaseTransaction.outs[0].value += rewardBalance;
+            //Add any remaining sats from the Math.floor
+            coinbaseTransaction.outs[0].value += rewardBalance;
+        }
 
         const segwitWitnessReservedValue = Buffer.alloc(32, 0);
 
@@ -221,7 +247,8 @@ export class MiningJob {
                 return bitcoinjs.payments.p2wsh({ address, network: this.network }).output;
             }
             default: {
-                return Buffer.alloc(0);
+                // Never pay an empty script: anyone could spend it.
+                throw new Error(`Unsupported payout address type for ${address}`);
             }
         }
     }
