@@ -1,9 +1,11 @@
 // Splash Pool payout rules, as pure functions (no I/O), so they can be tested
 // exhaustively. All amounts are integer satoshis.
 //
-//   fee    = floor(reward * feeBps / 10000)                 (1% = 100 bps)
-//   finder = min(finderBonus, reward - fee)
-//   split  = reward - fee - finder, shared by window work (time-based PPLNS)
+//   splash bonus = min(splashBonusSats, reward)       to the finder, no fee taken
+//   shared       = reward - splash bonus
+//   fee          = floor(shared * feePpm / 1,000,000)  (0.125% = 1250 ppm)
+//   split        = shared - fee, shared by window work (time-based PPLNS);
+//                  the finder gets its slice of this too
 //
 // Miners whose split share is under minPayout are dropped and their portion
 // is spread over the rest (non-custodial: nothing is owed or carried over).
@@ -25,8 +27,10 @@ export interface IPayoutParams {
     finderAddress: string;
     feeAddress: string;
     window: IWindowWork[];
-    feeBps: number;
-    finderBonusSats: number;
+    // Pool fee in parts per million of the shared portion (1250 = 0.125%).
+    feePpm: number;
+    // The Splash Bonus: paid in full to the block finder, before the fee.
+    splashBonusSats: number;
     minPayoutSats: number;
     maxSplitOutputs: number;
     // Optional serialized-size budget for all payout outputs, in bytes.
@@ -40,15 +44,20 @@ export interface IPayoutOutput {
     value: number;
     // What this output is made of, for display and audit.
     fee: number;
-    finder: number;
+    bonus: number;
     split: number;
+    // Sats left over from rounding the split down (finder only, a few sats).
+    rounding: number;
 }
 
 export interface IPayoutResult {
     outputs: IPayoutOutput[];
     reward: number;
     fee: number;
-    finderBonus: number;
+    splashBonus: number;
+    // reward - splashBonus: what the fee is taken from.
+    sharedPool: number;
+    // sharedPool - fee: what is split by window work.
     splitPool: number;
     roundingToFinder: number;
     paidMiners: number;
@@ -131,10 +140,10 @@ export function splitByWork(
 
 export function buildPayouts(p: IPayoutParams): IPayoutResult {
     assertSats('reward', p.reward);
-    assertSats('finderBonusSats', p.finderBonusSats);
+    assertSats('splashBonusSats', p.splashBonusSats);
     assertSats('minPayoutSats', p.minPayoutSats);
-    if (!Number.isInteger(p.feeBps) || p.feeBps < 0 || p.feeBps > 10000) {
-        throw new Error(`feeBps must be an integer 0..10000, got ${p.feeBps}`);
+    if (!Number.isInteger(p.feePpm) || p.feePpm < 0 || p.feePpm > 1_000_000) {
+        throw new Error(`feePpm must be an integer 0..1000000, got ${p.feePpm}`);
     }
     if (!Number.isInteger(p.maxSplitOutputs) || p.maxSplitOutputs < 0) {
         throw new Error(`maxSplitOutputs must be a non-negative integer, got ${p.maxSplitOutputs}`);
@@ -142,13 +151,15 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
     if (!p.finderAddress) {
         throw new Error('finderAddress is required');
     }
-    if (p.feeBps > 0 && !p.feeAddress) {
-        throw new Error('feeAddress is required when feeBps > 0');
+    if (p.feePpm > 0 && !p.feeAddress) {
+        throw new Error('feeAddress is required when feePpm > 0');
     }
 
-    const fee = Math.floor(p.reward * p.feeBps / 10000);
-    const finderBonus = Math.min(p.finderBonusSats, p.reward - fee);
-    const splitPool = p.reward - fee - finderBonus;
+    const splashBonus = Math.min(p.splashBonusSats, p.reward);
+    const sharedPool = p.reward - splashBonus;
+    // BigInt: sharedPool * feePpm can pass 2^53 for large rewards.
+    const fee = Number(BigInt(sharedPool) * BigInt(p.feePpm) / 1_000_000n);
+    const splitPool = sharedPool - fee;
 
     let budget: { bytes: number, sizeOf: (address: string) => number } = undefined;
     if (p.maxOutputBytes != null) {
@@ -177,18 +188,19 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
     const roundingToFinder = splitPool - splitPaid;
 
     const byAddress = new Map<string, IPayoutOutput>();
-    const add = (address: string, part: 'fee' | 'finder' | 'split', value: number) => {
+    const add = (address: string, part: 'fee' | 'bonus' | 'split' | 'rounding', value: number) => {
         if (value <= 0) {
             return;
         }
-        const o = byAddress.get(address) ?? { address, value: 0, fee: 0, finder: 0, split: 0 };
+        const o = byAddress.get(address) ?? { address, value: 0, fee: 0, bonus: 0, split: 0, rounding: 0 };
         o[part] += value;
         o.value += value;
         byAddress.set(address, o);
     };
 
     add(p.feeAddress, 'fee', fee);
-    add(p.finderAddress, 'finder', finderBonus + roundingToFinder);
+    add(p.finderAddress, 'bonus', splashBonus);
+    add(p.finderAddress, 'rounding', roundingToFinder);
     for (const [address, value] of paid) {
         add(address, 'split', value);
     }
@@ -208,7 +220,8 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
         outputs,
         reward: p.reward,
         fee,
-        finderBonus,
+        splashBonus,
+        sharedPool,
         splitPool,
         roundingToFinder,
         paidMiners: paid.size,

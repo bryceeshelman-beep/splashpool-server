@@ -50,6 +50,8 @@ export class ShareWindowService implements OnApplicationShutdown {
     private lock: Promise<void> = Promise.resolve();
     private readonly windowMs: number;
     private readonly shareLogPath: string;
+    // Time (ms) of the last accepted share since the pool started; null before the first.
+    private _lastShareAt: number | null = null;
 
     constructor(
         @InjectRepository(ShareBucketEntity)
@@ -59,6 +61,10 @@ export class ShareWindowService implements OnApplicationShutdown {
         const hours = parseFloat(this.configService.get('SHARE_WINDOW_HOURS'));
         this.windowMs = (Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_WINDOW_HOURS) * 60 * MINUTE_MS;
         this.shareLogPath = this.configService.get('SPLASH_SHARE_LOG') || null;
+    }
+
+    public get lastShareAt(): number | null {
+        return this._lastShareAt;
     }
 
     public get windowHours(): number {
@@ -79,6 +85,8 @@ export class ShareWindowService implements OnApplicationShutdown {
         } else {
             this.pending.set(key, { address, bucket, difficulty, shares: 1 });
         }
+        this.roundPending += difficulty;
+        this._lastShareAt = now;
 
         if (this.shareLogPath) {
             const line = JSON.stringify({ t: now, address, worker: worker ?? null, difficulty }) + '\n';
@@ -196,6 +204,64 @@ export class ShareWindowService implements OnApplicationShutdown {
             totalShares,
             miners,
         };
+    }
+
+    // Work for the website's round tank (RoundService takes it every 10 s).
+    private roundPending = 0;
+
+    public takeRoundWork(): number {
+        const w = this.roundPending;
+        this.roundPending = 0;
+        return w;
+    }
+
+    public returnRoundWork(work: number): void {
+        this.roundPending += work;
+    }
+
+    public peekRoundWork(): number {
+        return this.roundPending;
+    }
+
+    /** Total pool work in buckets starting at or after `sinceMs` (within the kept buckets). */
+    public async workSince(sinceMs: number): Promise<number> {
+        const sums = await this.activitySince(sinceMs);
+        let total = 0;
+        for (const v of sums.values()) {
+            total += v.difficulty;
+        }
+        return total;
+    }
+
+    /**
+     * Work and share count per address in minute buckets from `sinceMs` up to now,
+     * including work not yet flushed. With `address`, only that address.
+     */
+    public async activitySince(sinceMs: number, address?: string): Promise<Map<string, { difficulty: number, shares: number }>> {
+        return await this.exclusive(async () => {
+            const fromBucket = Math.floor(sinceMs / MINUTE_MS);
+            const rows: { address: string, difficulty: number, shares: number }[] = address == null
+                ? await this.repository.query(
+                    `SELECT address, SUM(difficulty) AS difficulty, SUM(shares) AS shares
+                     FROM share_bucket_entity WHERE bucket >= ? GROUP BY address`, [fromBucket])
+                : await this.repository.query(
+                    `SELECT address, SUM(difficulty) AS difficulty, SUM(shares) AS shares
+                     FROM share_bucket_entity WHERE bucket >= ? AND address = ? GROUP BY address`, [fromBucket, address]);
+            const out = new Map<string, { difficulty: number, shares: number }>();
+            for (const r of rows) {
+                out.set(r.address, { difficulty: Number(r.difficulty), shares: Number(r.shares) });
+            }
+            for (const p of this.pending.values()) {
+                if (p.bucket < fromBucket || (address != null && p.address !== address)) {
+                    continue;
+                }
+                const t = out.get(p.address) ?? { difficulty: 0, shares: 0 };
+                t.difficulty += p.difficulty;
+                t.shares += p.shares;
+                out.set(p.address, t);
+            }
+            return out;
+        });
     }
 
     /** Drop buckets more than an hour older than the window. */

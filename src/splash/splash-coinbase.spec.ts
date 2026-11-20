@@ -79,7 +79,7 @@ describe('Splash coinbase', () => {
         const reward = 5_000_000_000;
         const outputs = s.outputsFor(FINDER, reward);
         const tpl = jobTemplate(reward);
-        const job = new MiningJob(config({ POOL_IDENTIFIER: 'Splash Pool' }), net, '1', outputs, tpl);
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, tpl);
         const cb = job.cloneCoinbaseTransaction();
 
         // Payout outputs, then the witness commitment last.
@@ -96,13 +96,16 @@ describe('Splash coinbase', () => {
         const paid = cb.outs.reduce((sum, o) => sum + o.value, 0);
         expect(paid).toBe(reward);
 
-        // Fee first, finder second, 1% fee, 1 BTC finder.
+        // Fee first, finder second. Fee = 0.125% of (50 BTC - 1.125 BTC Splash Bonus).
         expect(bitcoinjs.address.fromOutputScript(cb.outs[0].script, net)).toBe(FEE);
-        expect(cb.outs[0].value).toBe(50_000_000);
+        expect(cb.outs[0].value).toBe(6_109_375);
         expect(bitcoinjs.address.fromOutputScript(cb.outs[1].script, net)).toBe(FINDER);
-        // 1 BTC bonus plus at most a few sats of rounding from the split.
-        expect(cb.outs[1].value).toBeGreaterThanOrEqual(100_000_000);
-        expect(cb.outs[1].value).toBeLessThan(100_000_000 + miners.length);
+        // 1.125 BTC Splash Bonus plus at most a few sats of rounding from the split.
+        expect(cb.outs[1].value).toBeGreaterThanOrEqual(112_500_000);
+        expect(cb.outs[1].value).toBeLessThan(112_500_000 + miners.length);
+
+        // Block identity: the coinbase scriptSig carries the /Splashpool/ tag.
+        expect(cb.ins[0].script.toString('latin1')).toContain('/Splashpool/');
 
         // Every address type got paid.
         for (const a of Object.values(ADDR)) {
@@ -117,8 +120,10 @@ describe('Splash coinbase', () => {
         const val = (outs: { address: string, value: number }[], addr: string) => outs.find(o => o.address === addr).value;
         // Each is the finder in its own job: bonus + its half of the split.
         expect(val(a, ADDR.p2wpkh)).toBe(val(b, ADDR.p2tr));
-        expect(val(a, ADDR.p2wpkh) - val(a, ADDR.p2tr)).toBe(100_000_000);
-        expect(val(b, ADDR.p2tr) - val(b, ADDR.p2wpkh)).toBe(100_000_000);
+        // The difference is the 1.125 BTC Splash Bonus, plus 1 sat of rounding:
+        // the split (50 BTC - 1.125 - 6,109,375 fee) is odd, so it halves unevenly.
+        expect(val(a, ADDR.p2wpkh) - val(a, ADDR.p2tr)).toBe(112_500_001);
+        expect(val(b, ADDR.p2tr) - val(b, ADDR.p2wpkh)).toBe(112_500_001);
     });
 
     it('skips window addresses that are not valid on this network', async () => {
@@ -131,7 +136,20 @@ describe('Splash coinbase', () => {
     it('refuses to start with a fee address that is invalid for the network', () => {
         expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_ADDRESS: MAINNET }), fakeWindow([]))).toThrow(/SPLASH_FEE_ADDRESS/);
         expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_ADDRESS: 'garbage' }), fakeWindow([]))).toThrow();
-        expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_BPS: '1.5' }), fakeWindow([]))).toThrow();
+        expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_PPM: '1.5' }), fakeWindow([]))).toThrow();
+        expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_PPM: '1000001' }), fakeWindow([]))).toThrow();
+    });
+
+    it('refuses the old fee and finder-bonus setting names', () => {
+        expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FEE_BPS: '100' }), fakeWindow([]))).toThrow(/SPLASH_FEE_PPM/);
+        expect(() => new PayoutService(config({ ...baseConfig, SPLASH_FINDER_BONUS_SATS: '100000000' }), fakeWindow([]))).toThrow(/SPLASH_BONUS_SATS/);
+    });
+
+    it('defaults to a 1.125 BTC Splash Bonus and a 0.125% fee on the shared portion', () => {
+        const st = new PayoutService(config(baseConfig), fakeWindow([])).status();
+        expect(st.splashBonusSats).toBe(112_500_000);
+        expect(st.feePpm).toBe(1250);
+        expect(st.feePercentOfShared).toBe(0.125);
     });
 
     it('stays off unless SPLASH_PAYOUTS=true', async () => {
@@ -162,7 +180,7 @@ describe('Splash coinbase', () => {
         // A template already filled to (4,000,000 - 50,000) weight, as bitcoind
         // builds it with blockreservedweight=50000.
         const tpl = jobTemplate(reward, Math.floor((4_000_000 - 50_000) / FILLER_WU));
-        const job = new MiningJob(config({ POOL_IDENTIFIER: 'Splash Pool' }), net, '1', outputs, tpl);
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, tpl);
         expect(job.cloneCoinbaseTransaction().weight()).toBeLessThan(50_000);
     });
 
@@ -189,7 +207,7 @@ describe('Splash coinbase', () => {
         const bytes = outputs.reduce((n, o) => n + s.outputBytes(o.address), 0);
         expect(bytes).toBeLessThanOrEqual(5000);
         expect(outputs.length).toBe(2 + Math.floor((5000 - 62) / 43));
-        const job = new MiningJob(config({ POOL_IDENTIFIER: 'Splash Pool' }), net, '1', outputs, jobTemplate(5_000_000_000));
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, jobTemplate(5_000_000_000));
         // coinb2 in mining.notify; 12,142 hex chars ran fine on both firmwares, 13,002 crashed them.
         expect((job as any).coinbasePart2.length).toBeLessThan(10_400);
         // The largest miners are the ones kept.

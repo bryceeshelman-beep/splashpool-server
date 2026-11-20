@@ -54,7 +54,10 @@ async function bootstrap() {
   //Taproot
   bitcoinjs.initEccLib(ecc);
 
-  await app.listen(process.env.API_PORT, '0.0.0.0', (err, address) => {
+  // Splash: the API is only for this machine (the site gatekeeper on 3340 and
+  // local tools). Set API_HOST=0.0.0.0 to expose it on the network on purpose.
+  const apiHost = process.env.API_HOST || '127.0.0.1';
+  await app.listen(process.env.API_PORT, apiHost, (err, address) => {
     console.log(`API listening on ${address}`);
   });
 

@@ -41,8 +41,8 @@ const intConfig = (raw: string, fallback: number) => {
 };
 
 /**
- * Splash Pool payouts: each miner's block template pays the fee, that miner as
- * finder, and everyone in the 3-day share window, straight from the block
+ * Splash Pool payouts: each miner's block template pays that miner the Splash
+ * Bonus as finder, the pool fee on the rest, and everyone in the 3-day share window, straight from the block
  * reward. The window is snapshotted every 30 seconds so building a job stays
  * synchronous and cheap.
  */
@@ -51,8 +51,8 @@ export class PayoutService implements OnModuleInit {
 
     public readonly enabled: boolean;
     public readonly feeAddress: string;
-    public readonly feeBps: number;
-    public readonly finderBonusSats: number;
+    public readonly feePpm: number;
+    public readonly splashBonusSats: number;
     public readonly minPayoutSats: number;
     public readonly maxSplitOutputs: number;
     public readonly maxOutputBytes: number;
@@ -68,8 +68,17 @@ export class PayoutService implements OnModuleInit {
     ) {
         this.enabled = this.configService.get('SPLASH_PAYOUTS')?.toLowerCase() === 'true';
         this.feeAddress = this.configService.get('SPLASH_FEE_ADDRESS') || '';
-        this.feeBps = intConfig(this.configService.get('SPLASH_FEE_BPS'), 100);
-        this.finderBonusSats = intConfig(this.configService.get('SPLASH_FINDER_BONUS_SATS'), 100_000_000);
+        // Renamed settings: refuse to start on the old names rather than
+        // silently ignore them (the old fee was on the whole reward, in bps).
+        for (const old of ['SPLASH_FEE_BPS', 'SPLASH_FINDER_BONUS_SATS']) {
+            if (this.configService.get(old) != null) {
+                throw new Error(`${old} is no longer used: set SPLASH_FEE_PPM (fee on the shared portion, 1250 = 0.125%) and SPLASH_BONUS_SATS (the Splash Bonus) instead`);
+            }
+        }
+        // 0.125% of the shared portion (reward minus the Splash Bonus).
+        this.feePpm = intConfig(this.configService.get('SPLASH_FEE_PPM'), 1250);
+        // The Splash Bonus: 1.125 BTC to the block finder, no fee taken.
+        this.splashBonusSats = intConfig(this.configService.get('SPLASH_BONUS_SATS'), 112_500_000);
         this.minPayoutSats = intConfig(this.configService.get('SPLASH_MIN_PAYOUT_SATS'), 10_000);
         this.maxSplitOutputs = intConfig(this.configService.get('SPLASH_MAX_SPLIT_OUTPUTS'), 250);
         // AxeOS 2.11 and OSM 2.15 crash between 6,000 and 6,400 bytes of
@@ -79,11 +88,11 @@ export class PayoutService implements OnModuleInit {
         this.network = networkFromConfig(this.configService.get('NETWORK'));
 
         if (this.enabled) {
-            if (this.feeBps > 10000) {
-                throw new Error('SPLASH_FEE_BPS must be at most 10000');
+            if (this.feePpm > 1_000_000) {
+                throw new Error('SPLASH_FEE_PPM must be at most 1000000');
             }
             // Refuse to start rather than build blocks that pay a bad fee script.
-            if (this.feeBps > 0 && !isPayableAddress(this.feeAddress, this.network)) {
+            if (this.feePpm > 0 && !isPayableAddress(this.feeAddress, this.network)) {
                 throw new Error(`SPLASH_FEE_ADDRESS "${this.feeAddress}" is not a valid ${this.configService.get('NETWORK')} address`);
             }
         }
@@ -92,7 +101,7 @@ export class PayoutService implements OnModuleInit {
     async onModuleInit(): Promise<void> {
         if (this.enabled) {
             await this.refresh();
-            console.log(`Splash payouts ON: fee ${this.feeBps / 100}% to ${this.feeAddress}, finder ${this.finderBonusSats} sats, min ${this.minPayoutSats} sats, max ${this.maxSplitOutputs} split outputs / ${this.maxOutputBytes} output bytes, window ${this.shareWindowService.windowHours}h`);
+            console.log(`Splash payouts ON: Splash Bonus ${this.splashBonusSats} sats to the finder, fee ${this.feePpm / 10000}% of the rest to ${this.feeAddress}, min ${this.minPayoutSats} sats, max ${this.maxSplitOutputs} split outputs / ${this.maxOutputBytes} output bytes, window ${this.shareWindowService.windowHours}h`);
         }
     }
 
@@ -136,8 +145,8 @@ export class PayoutService implements OnModuleInit {
             finderAddress,
             feeAddress: this.feeAddress,
             window: this.snapshot,
-            feeBps: this.feeBps,
-            finderBonusSats: this.finderBonusSats,
+            feePpm: this.feePpm,
+            splashBonusSats: this.splashBonusSats,
             minPayoutSats: this.minPayoutSats,
             maxSplitOutputs: this.maxSplitOutputs,
             maxOutputBytes: this.maxOutputBytes,
@@ -169,8 +178,9 @@ export class PayoutService implements OnModuleInit {
         return {
             enabled: this.enabled,
             feeAddress: this.feeAddress,
-            feeBps: this.feeBps,
-            finderBonusSats: this.finderBonusSats,
+            feePpm: this.feePpm,
+            feePercentOfShared: this.feePpm / 10000,
+            splashBonusSats: this.splashBonusSats,
             minPayoutSats: this.minPayoutSats,
             maxSplitOutputs: this.maxSplitOutputs,
             maxOutputBytes: this.maxOutputBytes,

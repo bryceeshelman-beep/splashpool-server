@@ -128,9 +128,7 @@ describe('MiningJob', () => {
 
         });
 
-        it('should remove pool identifier if block is too big with identifier', () => {
-            const expectedMiningIdentifier = '';
-
+        it('Splash: never drops the pool identifier to make a block fit (refuses the job instead)', () => {
             configService.get = jest.fn((key: string) => {
                 switch (key) {
                     case 'POOL_IDENTIFIER': return 'A'.repeat(84);
@@ -138,12 +136,25 @@ describe('MiningJob', () => {
                 return null;
             });
 
+            expect(() => new MiningJob(configService, bitcoinjs.networks.testnet, '1', payoutInformation, jobTemplate))
+                .toThrow(/exceeds 4000000/);
+            expect(console.warn).not.toBeCalled();
+        });
+
+        it('Splash: /Splashpool/ is in the coinbase of a full mainnet-size template', () => {
+            configService.get = jest.fn((key: string) => {
+                switch (key) {
+                    case 'POOL_IDENTIFIER': return '/Splashpool/';
+                }
+                return null;
+            });
+
             const miningJob = new MiningJob(configService, bitcoinjs.networks.testnet, '1', payoutInformation, jobTemplate);
             const response = JSON.parse(miningJob.response(jobTemplate));
 
-            const miningIdentifier = extractPoolIdentifierFromScript(response.params[2]);
-            expect(console.warn).toBeCalledWith('Block weight exceeds the maximum allowed weight, removing the pool identifier');
-            expect(miningIdentifier).toBe(expectedMiningIdentifier);
+            expect(extractPoolIdentifierFromScript(response.params[2])).toBe('/Splashpool/');
+            expect(response.params[2]).toContain(Buffer.from('/Splashpool/').toString('hex'));
+            expect(console.warn).not.toBeCalled();
         });
 
         it('should use the POOL_IDENTIFIER if it doesn\'t make the script size too big with identifier abcabc', () => {
@@ -165,8 +176,7 @@ describe('MiningJob', () => {
             expect(console.warn).not.toBeCalled();
         });
 
-        it('should remove pool identifier if script is too big with identifier', () => {
-            const expectedMiningIdentifier = '';
+        it('Splash: refuses an identifier too long for the coinbase script instead of dropping it', () => {
             jobTemplate.block.transactions = []; // remove transactions because we only want to test the script size
             configService.get = jest.fn((key: string) => {
                 switch (key) {
@@ -175,12 +185,9 @@ describe('MiningJob', () => {
                 return null;
             });
 
-            const miningJob = new MiningJob(configService, bitcoinjs.networks.testnet, '1', payoutInformation, jobTemplate);
-            const response = JSON.parse(miningJob.response(jobTemplate));
-
-            const miningIdentifier = extractPoolIdentifierFromScript(response.params[2]);
-            expect(console.warn).toBeCalledWith('Pool identifier is too long, removing the pool identifier');
-            expect(miningIdentifier).toBe(expectedMiningIdentifier);
+            expect(() => new MiningJob(configService, bitcoinjs.networks.testnet, '1', payoutInformation, jobTemplate))
+                .toThrow(/POOL_IDENTIFIER .* is too long/);
+            expect(console.warn).not.toBeCalled();
         });
     });
 

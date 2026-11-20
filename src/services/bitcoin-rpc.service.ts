@@ -172,6 +172,11 @@ export class BitcoinRpcService implements OnModuleInit {
 
     }
 
+    /** Hash of the active-chain block at `height` (throws if there is none). */
+    public async getBlockHash(height: number): Promise<string> {
+        return await this.callRpc<string>('getblockhash', [height]);
+    }
+
     public async SUBMIT_BLOCK(hexdata: string): Promise<string> {
         let response: string = 'unknown';
         try {

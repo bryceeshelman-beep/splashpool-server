@@ -57,6 +57,17 @@ describe('StratumV1Service', () => {
         expect(consoleLogSpy).toHaveBeenCalledWith('Master process skipping Stratum socket listeners');
     });
 
+    it('Splash: a single process (no cluster env) clears clients left from before a crash', async () => {
+        delete process.env.MASTER;
+        delete process.env.NODE_APP_INSTANCE;
+        process.env.STRATUM_PORT = '3334';
+        jest.spyOn(service as any, 'startSocketServer').mockImplementation(() => undefined);
+
+        await service.onModuleInit();
+
+        expect(clientService.deleteAll).toHaveBeenCalled();
+    });
+
     it('should start the Stratum listener in worker processes', async () => {
         process.env.MASTER = 'false';
         process.env.STRATUM_PORT = '3334';

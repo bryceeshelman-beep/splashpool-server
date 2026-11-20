@@ -7,9 +7,11 @@ usage: audit-blocks.py [--start H] [--datadir DIR] [--fee ADDR] [--pool-db FILE]
 
 Rules checked per block:
   - block is in the main chain
-  - first output = fee address, exactly floor(reward * 1%)
+  - Splash Bonus = min(1.125 BTC, reward), paid to the finder with no fee
+  - first output = fee address, exactly floor((reward - bonus) * 0.125%)
   - second output = the finder the pool recorded for that height (pool DB),
-    paid at least min(1 BTC, reward - fee)
+    paid at least the Splash Bonus
+  - coinbase scriptSig carries the /Splashpool/ tag
   - no address paid twice; every split output >= 10,000 sats
   - witness commitment is the last output, value 0
   - outputs sum to the reward (subsidy + fees, as the chain accepted it)
@@ -25,13 +27,16 @@ ap.add_argument('--datadir', default=os.environ.get('BITCOIN_DATADIR', os.path.e
 ap.add_argument('--fee', default='tb1q29suxu0226smyuy4zrkggelksx6aqe0u3t47ca')
 ap.add_argument('--pool-db', default=None)
 ap.add_argument('--share-log', default=None)
+ap.add_argument('--tag', default='/Splashpool/', help='coinbase tag every block must carry')
+ap.add_argument('--bonus', type=int, default=112_500_000, help='Splash Bonus in sats')
+ap.add_argument('--fee-ppm', type=int, default=1250, help='fee on the shared portion, parts per million')
 ap.add_argument('--quiet', action='store_true', help='only print problem blocks and the summary')
 ap.add_argument('start_pos', nargs='?', type=int)
 a = ap.parse_args()
 start = a.start if a.start is not None else (a.start_pos if a.start_pos is not None else 162245)
 
 CLI = [os.environ.get('BITCOIN_CLI', 'bitcoin-cli'), f'-datadir={a.datadir}']
-FEE_BPS, FINDER, MIN_PAYOUT, WINDOW_S = 100, 100_000_000, 10_000, 72 * 3600
+BONUS, FEE_PPM, MIN_PAYOUT, WINDOW_S = a.bonus, a.fee_ppm, 10_000, 72 * 3600
 
 def cli(*args):
     return json.loads(subprocess.check_output(CLI + list(args)))
@@ -72,19 +77,32 @@ for h in range(start, tip + 1):
     reward = sum(v for _, v in outs)
     paid = [o for o in outs if o[0] != 'nulldata']
     problems = []
-    fee = reward * FEE_BPS // 10000
-    if paid[0] != (a.fee, fee):
-        problems.append(f'fee {paid[0]} expected {fee}')
-    finder = paid[1] if len(paid) > 1 else (None, 0)
-    if finder[1] < min(FINDER, reward - fee):
-        problems.append(f'finder paid {finder[1]} < {min(FINDER, reward - fee)}')
+    bonus = min(BONUS, reward)
+    fee = (reward - bonus) * FEE_PPM // 1_000_000
+    if a.tag and a.tag.encode().hex() not in cb['vin'][0].get('coinbase', ''):
+        problems.append(f'coinbase tag {a.tag} missing')
+    if h in finders and a.fee in finders[h]:
+        # The fee address found the block itself: fee, bonus and its split
+        # share are one merged output, so only the total can be checked.
+        finder = paid[0]
+        if finder[0] != a.fee or finder[1] < fee + bonus:
+            problems.append(f'fee+finder output {paid[0]} expected >= {fee + bonus}')
+        fee_and_bonus_in_finder = fee + bonus
+    else:
+        if paid[0] != (a.fee, fee):
+            problems.append(f'fee {paid[0]} expected {fee}')
+        finder = paid[1] if len(paid) > 1 else (None, 0)
+        if finder[1] < bonus:
+            problems.append(f'finder paid {finder[1]} < Splash Bonus {bonus}')
+        fee_and_bonus_in_finder = bonus
     if h in finders and finder[0] not in finders[h]:
         problems.append(f'finder {finder[0]} but pool recorded {sorted(finders[h])}')
     if a.pool_db and h not in finders:
         problems.append('pool DB has no record of finding this block')
     if len({x for x, _ in paid}) != len(paid):
         problems.append('an address is paid twice')
-    for addr, v in paid[2:]:
+    first_split = paid.index(finder) + 1 if finder in paid else 2
+    for addr, v in paid[first_split:]:
         if v < MIN_PAYOUT:
             problems.append(f'{addr} paid {v} < min payout')
     if outs[-1][0] != 'nulldata' or outs[-1][1] != 0:
@@ -93,13 +111,13 @@ for h in range(start, tip + 1):
         problems.append('not in main chain')
 
     dev_note = ''
-    split_pool = reward - fee - min(FINDER, reward - fee)
+    split_pool = reward - bonus - fee
     if shares and split_pool > 0:
         fr = window_fractions(blk['time'])
         # Each output's split part: the finder's output carries bonus + rounding + split.
-        split_of = {addr: v for addr, v in paid[2:]}
+        split_of = {addr: v for addr, v in paid[first_split:]}
         if finder[0]:
-            split_of[finder[0]] = split_of.get(finder[0], 0) + finder[1] - min(FINDER, reward - fee)
+            split_of[finder[0]] = split_of.get(finder[0], 0) + finder[1] - fee_and_bonus_in_finder
         for addr, f in fr.items():
             dev = abs(split_of.get(addr, 0) / split_pool - f)
             max_dev = max(max_dev, dev)

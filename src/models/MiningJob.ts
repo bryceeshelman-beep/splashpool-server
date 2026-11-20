@@ -89,23 +89,20 @@ export class MiningJob {
 
         // Build the script
         let script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, extra, padding]);
-        // Check if the pool identifier is too long
+        // Splash Pool: the pool tag (/Splashpool/) is in EVERY coinbase. An
+        // identifier that doesn't fit is a configuration error, so refuse the
+        // job instead of silently mining an untagged block.
         if (script.length > MAX_SCRIPT_SIZE) {
-            console.warn('Pool identifier is too long, removing the pool identifier');
-            script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, padding]);
+            throw new Error(`Coinbase script ${script.length} bytes > ${MAX_SCRIPT_SIZE}: POOL_IDENTIFIER "${poolIdentifier}" is too long`);
         }
 
         this.coinbaseTransaction.ins[0].script = script;
         this.coinbaseTransaction.addOutput(bitcoinjs.script.compile([bitcoinjs.opcodes.OP_RETURN, Buffer.concat([segwitMagicBits, jobTemplate.block.witnessCommit])]), 0);
 
-        // Check if the pool identifier is too long
-        if ((this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)) > MAX_BLOCK_WEIGHT) {
-            console.warn('Block weight exceeds the maximum allowed weight, removing the pool identifier');
-            let script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, padding]);
-            this.coinbaseTransaction.ins[0].script = script;
-        }
         // Splash Pool: a large payout coinbase must still fit. Refuse the job
-        // rather than hand out work for a block the network would reject.
+        // rather than hand out work for a block the network would reject. (The
+        // tag is never dropped to make room: it is ~48 weight units, and the
+        // node reserves 50,000 for the coinbase via blockreservedweight.)
         if ((this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)) > MAX_BLOCK_WEIGHT) {
             throw new Error(`Block weight ${this.coinbaseTransaction.weight() + templateWeight(jobTemplate.block)} exceeds ${MAX_BLOCK_WEIGHT} with ${this.coinbaseTransaction.outs.length} coinbase outputs`);
         }

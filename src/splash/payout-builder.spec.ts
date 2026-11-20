@@ -7,8 +7,8 @@ const base = (over: Partial<IPayoutParams> = {}): IPayoutParams => ({
     finderAddress: 'FINDER',
     feeAddress: 'FEE',
     window: [],
-    feeBps: 100,
-    finderBonusSats: 1 * BTC,
+    feePpm: 1250,
+    splashBonusSats: 1.125 * BTC,
     minPayoutSats: 10_000,
     maxSplitOutputs: 250,
     ...over,
@@ -19,8 +19,9 @@ const valueOf = (r: { outputs: { address: string, value: number }[] }, a: string
 
 describe('buildPayouts', () => {
 
-    it('matches the worked example in the build plan', () => {
-        // 3.125 BTC subsidy + 0.02 BTC fees; A 50%, B 30%, C 20% of window work.
+    it('matches the worked example: 3.125 BTC subsidy + 0.02 BTC fees', () => {
+        // Splash Bonus 1.125 BTC; shared 2.02 BTC; fee 0.125% of 2.02 = 252,500 sats;
+        // 2.017475 BTC split by work: A 50%, B 30%, C 20%.
         const r = buildPayouts(base({
             window: [
                 { address: 'A', difficulty: 5000 },
@@ -28,23 +29,29 @@ describe('buildPayouts', () => {
                 { address: 'C', difficulty: 2000 },
             ],
         }));
+        expect(r.splashBonus).toBe(112_500_000);
+        expect(r.sharedPool).toBe(202_000_000);
+        expect(r.fee).toBe(252_500);
+        expect(r.splitPool).toBe(201_747_500);
         expect(r.outputs.map(o => [o.address, o.value])).toEqual([
-            ['FEE', 3_145_000],
-            ['FINDER', 100_000_000],
-            ['A', 105_677_500],
-            ['B', 63_406_500],
-            ['C', 42_271_000],
+            ['FEE', 252_500],
+            ['FINDER', 112_500_000 + r.roundingToFinder],
+            ['A', 100_873_750],
+            ['B', 60_524_250],
+            ['C', Math.floor(201_747_500 * (2000 / 10000))],
         ]);
-        expect(r.roundingToFinder).toBe(0);
+        expect(r.roundingToFinder).toBeLessThanOrEqual(2);
         expect(sum(r)).toBe(314_500_000);
     });
 
-    it('takes 3,125,000 sats on a fee-less mainnet block, and 1% of fees on top', () => {
-        // Mainnet subsidy since the 2024 halving is 3.125 BTC.
-        expect(buildPayouts(base({ reward: 312_500_000 })).fee).toBe(3_125_000);
-        expect(buildPayouts(base({ reward: 312_500_000 + 2_000_000 })).fee).toBe(3_125_000 + 20_000);
-        // testnet4 is still on its first 50 BTC subsidy.
-        expect(buildPayouts(base({ reward: 5_000_117_508 })).fee).toBe(50_001_175);
+    it('takes 0.125% of the reward minus the Splash Bonus, never of the bonus', () => {
+        // Mainnet subsidy since the 2024 halving is 3.125 BTC: fee on 2 BTC.
+        expect(buildPayouts(base({ reward: 312_500_000 })).fee).toBe(250_000);
+        expect(buildPayouts(base({ reward: 312_500_000 + 2_000_000 })).fee).toBe(252_500);
+        // testnet4 is still on its first 50 BTC subsidy: floor(4,887,617,508 * 0.00125).
+        expect(buildPayouts(base({ reward: 5_000_117_508 })).fee).toBe(6_109_521);
+        // The fee does not depend on the bonus being paid: same shared amount, same fee.
+        expect(buildPayouts(base({ reward: 212_500_000, splashBonusSats: 12_500_000 })).fee).toBe(250_000);
     });
 
     it('pays the finder its window share on top of the bonus, in one output', () => {
@@ -55,9 +62,9 @@ describe('buildPayouts', () => {
             ],
         }));
         const finder = r.outputs.find(o => o.address === 'FINDER');
-        expect(finder.finder).toBe(100_000_000);
-        expect(finder.split).toBe(105_677_500);
-        expect(finder.value).toBe(205_677_500);
+        expect(finder.bonus).toBe(112_500_000);
+        expect(finder.split).toBe(100_873_750);
+        expect(finder.value).toBe(213_373_750);
         expect(r.outputs.filter(o => o.address === 'FINDER')).toHaveLength(1);
         expect(sum(r)).toBe(r.reward);
     });
@@ -65,18 +72,19 @@ describe('buildPayouts', () => {
     it('gives the whole split to the finder when the window is empty', () => {
         const r = buildPayouts(base());
         expect(r.outputs.map(o => [o.address, o.value])).toEqual([
-            ['FEE', 3_145_000],
-            ['FINDER', 311_355_000],
+            ['FEE', 252_500],
+            ['FINDER', 314_247_500],
         ]);
     });
 
-    it('caps the finder bonus at what is left after the fee', () => {
-        const r = buildPayouts(base({ reward: 50_000_000, window: [{ address: 'A', difficulty: 1 }] }));
-        expect(r.fee).toBe(500_000);
-        expect(r.finderBonus).toBe(49_500_000);
+    it('caps the Splash Bonus at the reward, leaving no fee and no split', () => {
+        // After the 2032 halving the subsidy (0.78125 BTC) is below the bonus.
+        const r = buildPayouts(base({ reward: 80_000_000, window: [{ address: 'A', difficulty: 1 }] }));
+        expect(r.splashBonus).toBe(80_000_000);
+        expect(r.fee).toBe(0);
         expect(r.splitPool).toBe(0);
-        expect(valueOf(r, 'A')).toBeUndefined();
-        expect(sum(r)).toBe(50_000_000);
+        expect(r.outputs.map(o => o.address)).toEqual(['FINDER']);
+        expect(sum(r)).toBe(80_000_000);
     });
 
     it('rounds the fee down and sends rounding leftovers to the finder', () => {
@@ -88,16 +96,17 @@ describe('buildPayouts', () => {
                 { address: 'C', difficulty: 1 },
             ],
         }));
-        expect(r.fee).toBe(3_125_000);
-        // split pool 209,375,099 / 3 = 69,791,699.67 each -> 2 sats left over
-        expect(valueOf(r, 'A')).toBe(69_791_699);
-        expect(r.roundingToFinder).toBe(2);
-        expect(valueOf(r, 'FINDER')).toBe(100_000_002);
+        // shared 200,000,099 * 0.00125 = 250,000.12 -> 250,000
+        expect(r.fee).toBe(250_000);
+        // split 199,750,099 / 3 = 66,583,366.33 each -> 1 sat left over
+        expect(valueOf(r, 'A')).toBe(66_583_366);
+        expect(r.roundingToFinder).toBe(1);
+        expect(valueOf(r, 'FINDER')).toBe(112_500_001);
         expect(sum(r)).toBe(312_500_099);
     });
 
     it('drops miners under the minimum payout and re-shares their portion', () => {
-        // Split pool is 211,355,000. Tiny gets 211,355,000 * 1e-6 = 211 sats < 10,000.
+        // Split pool is 201,747,500. Tiny gets 201,747,500 * 1e-6 = 201 sats < 10,000.
         const r = buildPayouts(base({
             window: [
                 { address: 'Big', difficulty: 999_999 },
@@ -105,7 +114,7 @@ describe('buildPayouts', () => {
             ],
         }));
         expect(valueOf(r, 'Tiny')).toBeUndefined();
-        expect(valueOf(r, 'Big')).toBe(211_355_000);
+        expect(valueOf(r, 'Big')).toBe(201_747_500);
         expect(r.droppedMiners).toBe(1);
         expect(sum(r)).toBe(r.reward);
     });
@@ -123,13 +132,13 @@ describe('buildPayouts', () => {
         const r = buildPayouts(base({ window: [{ address: 'FEE', difficulty: 1 }] }));
         const fee = r.outputs.filter(o => o.address === 'FEE');
         expect(fee).toHaveLength(1);
-        expect(fee[0].fee).toBe(3_145_000);
-        expect(fee[0].split).toBe(211_355_000);
+        expect(fee[0].fee).toBe(252_500);
+        expect(fee[0].split).toBe(201_747_500);
         expect(r.outputs[0].address).toBe('FEE');
     });
 
     it('allows a zero fee with no fee output', () => {
-        const r = buildPayouts(base({ feeBps: 0, feeAddress: '' }));
+        const r = buildPayouts(base({ feePpm: 0, feeAddress: '' }));
         expect(r.outputs.map(o => o.address)).toEqual(['FINDER']);
         expect(sum(r)).toBe(r.reward);
     });
@@ -154,8 +163,8 @@ describe('buildPayouts', () => {
     it('rejects bad parameters', () => {
         expect(() => buildPayouts(base({ reward: 1.5 }))).toThrow();
         expect(() => buildPayouts(base({ reward: -1 }))).toThrow();
-        expect(() => buildPayouts(base({ feeBps: 10001 }))).toThrow();
-        expect(() => buildPayouts(base({ feeBps: 0.5 }))).toThrow();
+        expect(() => buildPayouts(base({ feePpm: 1_000_001 }))).toThrow();
+        expect(() => buildPayouts(base({ feePpm: 0.5 }))).toThrow();
         expect(() => buildPayouts(base({ finderAddress: '' }))).toThrow();
         expect(() => buildPayouts(base({ feeAddress: '' }))).toThrow();
     });

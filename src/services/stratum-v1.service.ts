@@ -56,7 +56,10 @@ export class StratumV1Service implements OnModuleInit {
 
     async onModuleInit(): Promise<void> {
 
-        if (process.env.NODE_APP_INSTANCE == '0' || process.env.MASTER == 'true') {
+        // Splash Pool: also when run as a single process (no NODE_APP_INSTANCE),
+        // so connections from before a crash or reboot aren't still counted.
+        const singleProcess = process.env.NODE_APP_INSTANCE == null && process.env.MASTER == null;
+        if (singleProcess || process.env.NODE_APP_INSTANCE == '0' || process.env.MASTER == 'true') {
             await this.clientService.deleteAll();
         }
 

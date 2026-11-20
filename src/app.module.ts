@@ -30,6 +30,10 @@ import { ExternalSharesModule } from './ORM/external-shares/external-shares.modu
 import { ShareWindowModule } from './ORM/share-window/share-window.module';
 import { SplashModule } from './splash/splash.module';
 import { SplashController } from './controllers/splash/splash.controller';
+import { SiteModule } from './splash/site/site.module';
+import { SiteController } from './splash/site/site.controller';
+import { SiteService } from './splash/site/site.service';
+import { RoundService } from './splash/site/round.service';
 
 const ORMModules = [
     ClientStatisticsModule,
@@ -40,7 +44,8 @@ const ORMModules = [
     RpcBlocksModule,
     ExternalSharesModule,
     ShareWindowModule,
-    SplashModule
+    SplashModule,
+    SiteModule
 ]
 
 @Module({
@@ -66,7 +71,8 @@ const ORMModules = [
         ClientController,
         AddressController,
         ExternalShareController,
-        SplashController
+        SplashController,
+        SiteController
     ],
     providers: [
         DiscordService,
@@ -80,6 +86,8 @@ const ORMModules = [
         BTCPayService,
         BraiinsService,
         ExternalSharesService,
+        RoundService,
+        SiteService,
     ],
 })
 export class AppModule {

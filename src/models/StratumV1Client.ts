@@ -440,7 +440,7 @@ export class StratumV1Client {
             this.noFee = this.hashRate != 0 && this.hashRate < 50000000000000;
         }
         if (this.payoutService?.enabled) {
-            // Splash Pool: fee, this miner as finder, and the 3-day window split.
+            // Splash Pool: this miner's Splash Bonus as finder, the fee, and the 3-day window split.
             payoutInformation = this.payoutService.outputsFor(this.clientAuthorization.address, jobTemplate.blockData.coinbasevalue);
         } else if (this.noFee || devFeeAddress == null || devFeeAddress.length < 1) {
             payoutInformation = [
