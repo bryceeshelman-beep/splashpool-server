@@ -146,7 +146,7 @@ export class StratumV1Service implements OnModuleInit {
         listener.server = server;
         listener.paused = false;
 
-        server.listen(listener.port, () => {
+        server.listen(listener.port, '0.0.0.0', () => { // IPv4 only: a router's NAT doesn't shield IPv6
             console.log(`Stratum server is listening on port ${listener.port}`);
         });
     }

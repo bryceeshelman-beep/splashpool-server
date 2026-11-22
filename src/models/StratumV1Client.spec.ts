@@ -2,7 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Socket } from 'net';
-import { BehaviorSubject } from 'rxjs';
+import { BehaviorSubject, ReplaySubject } from 'rxjs';
 import { DataSource } from 'typeorm';
 
 import { MockRecording1 } from '../../test/models/MockRecording1';
@@ -24,6 +24,7 @@ import { IMiningInfo } from './bitcoin-rpc/IMiningInfo';
 import { MiningJob } from './MiningJob';
 import { StratumV1Client } from './StratumV1Client';
 import { MiningSubmitMessage } from './stratum-messages/MiningSubmitMessage';
+import * as blockSubmission from '../splash/block-submission';
 
 
 
@@ -640,6 +641,62 @@ describe('StratumV1Client', () => {
         expect((client as any).write).lastCalledWith(`{"id":5,"error":null,"result":true}\n`);
     });
 
+    it.each([
+        ['high-hash', false],
+        ['RPC_ERROR: timeout', false],
+        ['inconclusive', false],
+        ['SUCCESS!', true],
+    ])('node answers %s: recorded as found = %s', async (answer, found) => {
+        (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mockResolvedValue(answer);
+        (bitcoinRpcService.getBlockHash as jest.Mock).mockResolvedValue('someone else');
+        jest.spyOn(blockSubmission, 'settleBlock').mockResolvedValue({ outcome: 'unknown', response: answer as string });
+        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+        jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+            submissionDifficulty: Number.MAX_SAFE_INTEGER,
+            submissionHash: 'block-share'
+        });
+        const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+        jest.spyOn(addressSettings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+
+        emitMessage(MockRecording1.MINING_SUBMIT);
+        jest.useRealTimers();
+        await new Promise((r) => setTimeout(r, 1000));
+
+        expect(blocksService.save).toHaveBeenCalledTimes(found ? 1 : 0);
+        expect(notificationService.notifySubscribersBlockFound).toHaveBeenCalledTimes(found ? 1 : 0);
+        expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+    });
+
+    it('records a block that is accepted on a retry', async () => {
+        (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mockResolvedValue('RPC_ERROR: timeout');
+        (bitcoinRpcService.getBlockHash as jest.Mock).mockResolvedValue('someone else');
+        jest.spyOn(blockSubmission, 'settleBlock').mockResolvedValue({ outcome: 'accepted', response: 'SUCCESS!' });
+        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+        jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+            submissionDifficulty: Number.MAX_SAFE_INTEGER,
+            submissionHash: 'block-share'
+        });
+        const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+        jest.spyOn(addressSettings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+
+        emitMessage(MockRecording1.MINING_SUBMIT);
+        jest.useRealTimers();
+        await new Promise((r) => setTimeout(r, 1000));
+
+        expect(blocksService.save).toHaveBeenCalledTimes(1);
+        expect(notificationService.notifySubscribersBlockFound).toHaveBeenCalledTimes(1);
+    });
+
 
 
 
@@ -724,6 +781,315 @@ describe('StratumV1Client', () => {
         });
     });
 
+
+    describe('duplicate shares', () => {
+        const [user, jobId, en2, ntime, nonce, version] = JSON.parse(MockRecording1.MINING_SUBMIT).params;
+        const submit = async (...fields: any[]) => {
+            emitMessage(JSON.stringify({ id: 5, method: 'mining.submit', params: [user, ...fields] }));
+            await new Promise((r) => setTimeout(r, 100));
+        };
+        const replies = () => (client as any).write.mock.calls.map(c => c[0]).join('');
+        beforeEach(async () => {
+            jest.spyOn(client as any, 'write').mockResolvedValue(true);
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage('{"id":4,"method":"mining.suggest_difficulty","params":[0]}');
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+        });
+
+        const up = (s: string) => s.toUpperCase();
+        it.each([
+            ['uppercase extranonce2', [en2, ntime, nonce, version], [up(en2), ntime, nonce, version]],
+            ['uppercase ntime', [en2, ntime, nonce, version], [en2, up(ntime), nonce, version]],
+            ['uppercase nonce', [en2, ntime, nonce, version], [en2, ntime, up(nonce), version]],
+            ['uppercase version', [en2, ntime, nonce, '0000a000'], [en2, ntime, nonce, '0000A000']],
+            ['mixed case', [en2, ntime, nonce, version], [en2, ntime, 'Ed460D91', version]],
+            ['omitted, then zero version', [en2, ntime, nonce], [en2, ntime, nonce, '00000000']],
+            ['zero, then omitted version', [en2, ntime, nonce, '00000000'], [en2, ntime, nonce]],
+            ['omitted, then null version', [en2, ntime, nonce], [en2, ntime, nonce, null]],
+        ])('credits once: %s', async (_, first, second) => {
+            await submit(jobId, ...first);
+            await submit(jobId, ...second);
+            expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+            expect(replies()).toContain('Duplicate share');
+        });
+
+        it('credits once: the same header under two job ids', async () => {
+            stratumV1JobsService.jobs['2'] = stratumV1JobsService.jobs[jobId];
+            await submit(jobId, en2, ntime, nonce, version);
+            await submit('2', en2, ntime, nonce, version);
+            expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+        });
+
+        it('credits once: XOR and BIP310 encodings of one version', async () => {
+            const template = stratumV1JobsService.getJobTemplateById('1');
+            // A signalling bit inside the mask is where the two readings differ.
+            template.block.version ^= 0x10000000;
+            template.blockData.networkDifficulty = 100;
+            const spy = jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({ submissionDifficulty: 10 });
+            await submit(jobId, en2, ntime, nonce, version);
+            const real = spy.mock.calls[0][0] as Buffer;
+            // Only the real header meets the difficulty, so the BIP310 fallback must find it.
+            spy.mockImplementation((h: Buffer) => ({ submissionDifficulty: h.equals(real) ? 10 : 1 }));
+            (client as any).sessionDifficulty = 5;
+            (client as any).issuedJobs?.set(jobId, 5);
+            await submit(jobId, en2, ntime, nonce, '10002000');
+            expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+            expect(replies()).toContain('Duplicate share');
+        });
+
+        it.each([0, 1, 2, 3])('refuses a padded copy of field %i', async (i) => {
+            const fields = [en2, ntime, nonce, version];
+            await submit(jobId, ...fields);
+            fields[i] = `0${fields[i]}`;
+            await submit(jobId, ...fields);
+            expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+            expect(replies()).toContain('Mining Submit validation error');
+        });
+
+        it('still credits a different nonce', async () => {
+            await submit(jobId, en2, ntime, nonce, version);
+            await submit(jobId, en2, ntime, 'ed460d92', version);
+            expect(shareWindowService.recordShare).toHaveBeenCalledTimes(2);
+        });
+
+        it('submits exactly the header it checked', async () => {
+            const spy = jest.spyOn(client as any, 'calculateDifficulty')
+                .mockReturnValue({ submissionDifficulty: Number.MAX_SAFE_INTEGER, submissionHash: 'block' });
+            jest.spyOn(moduleRef.get<AddressSettingsService>(AddressSettingsService), 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+            await submit(jobId, up(en2), up(ntime), up(nonce), version);
+            const blockHex = (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mock.calls.slice(-1)[0][0];
+            expect(blockHex.slice(0, 160)).toBe((spy.mock.calls[0][0] as Buffer).toString('hex'));
+        });
+    });
+
+    describe('share credit', () => {
+        const [user, , en2, ntime, nonce, version] = JSON.parse(MockRecording1.MINING_SUBMIT).params;
+        const address = user.split('.')[0];
+        const tick = () => new Promise((r) => setTimeout(r, 100));
+        const send = async (method: string, ...params: any[]) => {
+            emitMessage(JSON.stringify({ id: method === 'mining.submit' ? 5 : 3, method, params }));
+            await tick();
+        };
+        const submit = (id = '1', t = ntime, n = nonce, v = version) => send('mining.submit', user, id, en2, t, n, v);
+        const login = async (password = 'x') => {
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            await send('mining.authorize', user, password);
+            stratumV1JobsService.getJobTemplateById('1').blockData.networkDifficulty = 1e14;
+        };
+        const credits = () => shareWindowService.recordShare.mock.calls.map(c => c[1]);
+        const replies = () => (client as any).write.mock.calls.map(c => c[0]).join('');
+        const notifies = () => (client as any).write.mock.calls.filter(c => c[0].includes('"method":"mining.notify"')).length;
+        let difficulty: jest.SpyInstance;
+        beforeEach(() => {
+            jest.spyOn(client as any, 'write').mockResolvedValue(true);
+            jest.spyOn(socket, 'write').mockImplementation(() => true);
+            difficulty = jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({ submissionDifficulty: 1e6 });
+            const settings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+            jest.spyOn(settings, 'updateBestDifficultyIfHigher').mockResolvedValue(undefined);
+            jest.spyOn(settings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+        });
+
+        it('honours d= at the first login', async () => {
+            await login('d=200000');
+            await submit();
+            expect(credits()).toEqual([200000]);
+        });
+
+        it.each(['1000000', '1000000000000000', '9'.repeat(60)])('ignores d=%s on a later login', async (d) => {
+            await login();
+            await send('mining.authorize', user, `d=${d}`);
+            await submit();
+            expect(credits()).toEqual([100000]);
+            expect((client as any).sessionDifficulty).toBe(100000);
+        });
+
+        it('credits the issued difficulty when it changes during the reply write', async () => {
+            await login();
+            let release: () => void;
+            (client as any).write.mockImplementation((m: string) => m.startsWith('{"id":5,')
+                ? new Promise(r => release = () => r(true)) : Promise.resolve(true));
+            await submit();
+            (client as any).sessionDifficulty = 1e15;
+            release();
+            await tick();
+            expect(credits()).toEqual([100000]);
+        });
+
+        it('keeps each job at its own difficulty across a retarget', async () => {
+            await login();
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(400000);
+            await (client as any).checkDifficulty();
+            await submit('1');
+            await submit('2');
+            expect(credits()).toEqual([100000, 400000]);
+        });
+
+        it('applies a lower retarget only to the new job', async () => {
+            await login();
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(4096);
+            await (client as any).checkDifficulty();
+            difficulty.mockReturnValue({ submissionDifficulty: 50000 });
+            await submit('1');
+            expect(replies()).toContain('Difficulty too low');
+            await submit('2');
+            expect(credits()).toEqual([4096]);
+        });
+
+        it('makes every job different work, so one hash has one difficulty', async () => {
+            await login();
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(400000);
+            await (client as any).checkDifficulty();
+            await submit('1');
+            await submit('2');
+            const [a, b] = difficulty.mock.calls.map(c => c[0] as Buffer);
+            expect(a.equals(b)).toBe(false);
+        });
+
+        it('sends a new job for a suggestion that follows the first job', async () => {
+            await login();
+            expect(notifies()).toBe(1);
+            await send('mining.suggest_difficulty', 512);
+            expect(notifies()).toBe(2);
+            await submit('2');
+            expect(credits()).toEqual([512]);
+        });
+
+        it('takes one suggestion even when two arrive together', async () => {
+            await login();
+            emitMessage('{"id":8,"method":"mining.suggest_difficulty","params":[512]}');
+            emitMessage('{"id":9,"method":"mining.suggest_difficulty","params":[9000000]}');
+            await tick();
+            expect((client as any).sessionDifficulty).toBe(512);
+        });
+
+        it('credits a block at no more than the network difficulty', async () => {
+            await login('d=1000000000000000');
+            difficulty.mockReturnValue({ submissionDifficulty: 2e14 });
+            await submit();
+            expect(credits()).toEqual([1e14]);
+        });
+
+        it('refuses a job issued to another connection', async () => {
+            await login();
+            stratumV1JobsService.jobs['abc'] = stratumV1JobsService.jobs['1'];
+            await submit('abc');
+            expect(credits()).toEqual([]);
+            expect(replies()).toContain('Job not found');
+        });
+
+        it('forgets issued jobs on a new block', async () => {
+            await login();
+            expect([...((client as any).issuedJobs?.keys() ?? [])]).toEqual(['1']);
+            newBlockEmitter.next({ blocks: MockRecording1.BLOCK_TEMPLATE.height + 1 } as IMiningInfo);
+            await tick();
+            const held = [...((client as any).issuedJobs?.keys() ?? [])];
+            newBlockEmitter.next({ blocks: MockRecording1.BLOCK_TEMPLATE.height } as IMiningInfo);
+            expect(held).toEqual(['2']);
+        });
+
+        const hex = (n: number) => n.toString(16).padStart(8, '0');
+        it.each([
+            ['before mintime', (min: number) => min - 1, false],
+            ['at mintime', (min: number) => min, true],
+            ['two hours ahead', (_, now: number) => now + 7199, true],
+            ['over two hours ahead', (_, now: number) => now + 7210, false],
+            ['year 2106', () => 0xffffffff, false],
+        ])('ntime %s', async (_, pick: (min: number, now: number) => number, accepted) => {
+            await login();
+            await submit('1', hex(pick(MockRecording1.BLOCK_TEMPLATE.mintime, Math.floor(Date.now() / 1000))));
+            expect(credits()).toHaveLength(accepted ? 1 : 0);
+            if (!accepted) expect(replies()).toContain('Invalid ntime');
+        });
+
+        it.each([
+            ['00002000', true], ['1fffe000', true], ['1005c000', true],
+            ['00001000', false], ['00000001', false], ['20000000', false], ['80000000', false], ['ffffffff', false],
+        ])('version bits %s accepted=%s', async (bits, accepted) => {
+            await login();
+            await submit('1', ntime, nonce, bits);
+            expect(credits()).toHaveLength(accepted ? 1 : 0);
+            if (!accepted) expect(replies()).toContain('Invalid version bits');
+        });
+    });
+
+    describe('input limits', () => {
+        beforeEach(() => jest.spyOn(client as any, 'write').mockResolvedValue(true));
+
+        it('closes on a partial line over 16 KiB, even in small chunks', () => {
+            for (let i = 0; i < 17; i++) socketEmitter(Buffer.alloc(1024, 'x'));
+            expect(socket.destroy).toHaveBeenCalled();
+            expect((client as any).buffer).toBe('');
+        });
+
+        it('closes on a complete line over 16 KiB', () => {
+            emitMessage(JSON.stringify({ method: 'none', pad: 'x'.repeat(17000) }));
+            expect(socket.destroy).toHaveBeenCalled();
+        });
+
+        it('closes when over 1 MiB is waiting to be processed', () => {
+            jest.spyOn(client as any, 'handleMessage').mockReturnValue(new Promise(() => undefined));
+            const chunk = Buffer.from(`${'x'.repeat(1023)}\n`.repeat(64));
+            for (let i = 0; i < 17; i++) socketEmitter(chunk);
+            expect(socket.destroy).toHaveBeenCalled();
+        });
+
+        it('leaves a normal split message alone', async () => {
+            const m = `${MockRecording1.MINING_SUBSCRIBE}\n`;
+            socketEmitter(Buffer.from(m.slice(0, 10)));
+            socketEmitter(Buffer.from(m.slice(10)));
+            await new Promise((r) => setTimeout(r, 50));
+            expect(socket.destroy).not.toHaveBeenCalled();
+            expect((client as any).write).toHaveBeenCalled();
+        });
+    });
+
+    describe('payout safety', () => {
+        let ready$: ReplaySubject<void>;
+        let payouts: any;
+        const notified = () => (client as any).write.mock.calls.some(c => c[0].includes('"method":"mining.notify"'));
+        const connect = async () => {
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+        };
+        beforeEach(() => {
+            ready$ = new ReplaySubject<void>(1);
+            payouts = {
+                enabled: true, ready: false, ready$,
+                outputsFor: jest.fn((address, value) => [{ address, value }]),
+            };
+            (client as any).payoutService = payouts;
+            jest.spyOn(client as any, 'write').mockResolvedValue(true);
+        });
+
+        it('holds jobs until the first window read, then sends one', async () => {
+            await connect();
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(4096);
+            jest.spyOn(socket, 'write').mockImplementation(() => true);
+            await (client as any).checkDifficulty(); // a retarget must not slip a job out
+            expect(notified()).toBe(false);
+            expect(payouts.outputsFor).not.toHaveBeenCalled();
+            expect(socket.destroy).not.toHaveBeenCalled();
+            payouts.ready = true;
+            ready$.next();
+            await new Promise((r) => setTimeout(r, 100));
+            expect(notified()).toBe(true);
+        });
+
+        it.each(['output building', 'coinbase building'])('closes only this connection when %s throws', async (stage) => {
+            payouts.ready = true;
+            ready$.next();
+            payouts.outputsFor.mockImplementation((_, value) => {
+                if (stage === 'output building') throw new Error('bad');
+                return [{ address: 'not-an-address', value }];
+            });
+            await connect();
+            expect(notified()).toBe(false);
+            expect(socket.destroy).toHaveBeenCalled();
+            expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('no job built'), expect.anything());
+        });
+    });
 
     describe('Splash reject limit', () => {
         const withConfig = (extra: Record<string, string>) => {

@@ -124,6 +124,13 @@ describe('StratumV1Service', () => {
         expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining('Resuming Stratum accepts'));
     });
 
+    it('Splash: listens on IPv4 only', () => {
+        const server = { listen: jest.fn() };
+        jest.spyOn(service as any, 'createSocketServer').mockReturnValue(server);
+        (service as any).listen({ port: 3333, server: null, paused: true });
+        expect(server.listen).toHaveBeenCalledWith(3333, '0.0.0.0', expect.any(Function));
+    });
+
     it('should cap listener connections and drop excess cluster connections', () => {
         process.env.STRATUM_MAX_CONNECTIONS_PER_LISTENER = '250';
         const server = {} as any;

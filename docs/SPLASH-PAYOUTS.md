@@ -34,7 +34,7 @@ times (reward - fee): the bonus changes the shape of payouts, not the average.
 |---|---|---|
 | `SPLASH_BONUS_SATS` | 112500000 | The Splash Bonus (1.125 BTC) |
 | `SPLASH_FEE_PPM` | 1250 | Fee on the shared reward, parts per million (1250 = 0.125%) |
-| `POOL_IDENTIFIER` | Public-Pool | Coinbase tag; Splash uses `/Splashpool/` |
+| `POOL_IDENTIFIER` | Public-Pool | Coinbase tag; Splash uses `-=+SplashPool+=-` |
 
 The old names `SPLASH_FEE_BPS` (fee on the whole reward) and
 `SPLASH_FINDER_BONUS_SATS` are refused at startup so an old config can't

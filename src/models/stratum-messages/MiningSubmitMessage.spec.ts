@@ -48,6 +48,22 @@ describe('MiningSubmitMessage', () => {
             expect(errors.some(error => error.property === 'extraNonce2')).toBe(true);
         });
 
+        const valid = ['user', '1', '9902000000000000', '64b1f10f', '2402812d', '00006000'];
+        const badForms: [string, (s: string) => any][] = [
+            ['leading zero', s => `0${s}`], ['short', s => s.slice(1)], ['0x prefix', s => `0x${s.slice(2)}`],
+            ['leading space', s => ` ${s.slice(1)}`], ['trailing space', s => `${s.slice(1)} `],
+            ['newline', s => `${s.slice(1)}\n`], ['sign', s => `+${s.slice(1)}`],
+            ['trailing junk', s => `${s.slice(1)}z`], ['empty', () => ''], ['number', () => 12345678],
+        ];
+        const cases = [[2, 'extraNonce2'], [3, 'ntime'], [4, 'nonce'], [5, 'versionMask']]
+            .flatMap(([i, field]) => badForms.map(([form, change]) => [field, form, i, change] as const));
+        it.each(cases)('rejects %s: %s', async (field, _, i, change) => {
+            const params: any[] = [...valid];
+            params[i] = change(valid[i]);
+            const errors = await validate(plainToInstance(MiningSubmitMessage, { id: 5, method: 'mining.submit', params }));
+            expect(errors.map(e => e.property)).toContain(field);
+        });
+
         it('should reject long extranonce2 submissions', async () => {
             const longMessage = plainToInstance(
                 MiningSubmitMessage,

@@ -9,7 +9,8 @@
 //
 // Miners whose split share is under minPayout are dropped and their portion
 // is spread over the rest (non-custodial: nothing is owed or carried over).
-// At most maxSplitOutputs miners are paid; the smallest are dropped first.
+// At most maxSplitOutputs miners are paid; the smallest are dropped first,
+// but the finder and fee addresses are never dropped by this or the byte limit.
 // With maxOutputBytes, all outputs together (fee, finder, split) must also fit
 // in that many serialized bytes: miner firmware (AxeOS/ESP-Miner and forks)
 // crashes on mining.notify lines much over ~12 KB, and a P2TR output is 43
@@ -73,8 +74,9 @@ function assertSats(name: string, v: number) {
 /**
  * Proportional integer split of `pool` sats by `weights`, after dropping
  * entries below `minPayout` (repeatedly, since dropping raises the others)
- * and keeping at most `maxCount` of the largest. Returns floor amounts; the
- * caller assigns the leftover sats.
+ * and keeping at most `maxCount` of the largest. `pinned` addresses (finder,
+ * fee) survive the count and byte cuts but not the minimum. Returns floor
+ * amounts; the caller assigns the leftover sats.
  */
 export function splitByWork(
     pool: number,
@@ -82,6 +84,7 @@ export function splitByWork(
     minPayout: number,
     maxCount: number,
     budget?: { bytes: number, sizeOf: (address: string) => number },
+    pinned: ReadonlySet<string> = new Set(),
 ): { paid: Map<string, number>, dropped: number } {
     // Merge duplicate addresses and ignore non-positive work.
     const work = new Map<string, number>();
@@ -94,20 +97,34 @@ export function splitByWork(
     const total = work.size;
 
     // Largest work first; ties broken by address so the result is deterministic.
-    let kept = Array.from(work.entries())
+    const ranked = Array.from(work.entries())
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-    if (kept.length > maxCount) {
-        kept = kept.slice(0, Math.max(0, maxCount));
-    }
-    if (budget) {
-        // Take miners largest-first while their outputs still fit.
-        let used = 0;
-        let fit = 0;
-        while (fit < kept.length && used + budget.sizeOf(kept[fit][0]) <= budget.bytes) {
-            used += budget.sizeOf(kept[fit][0]);
-            fit++;
+
+    // Pinned addresses take count slots but no bytes (their outputs exist
+    // anyway). Everyone else is taken largest-first until a limit is hit.
+    let slots = maxCount;
+    for (const address of pinned) {
+        if (work.has(address)) {
+            slots--;
         }
-        kept = kept.slice(0, fit);
+    }
+    let used = 0;
+    const kept: [string, number][] = [];
+    for (const entry of ranked) {
+        if (!pinned.has(entry[0])) {
+            if (slots <= 0) {
+                continue;
+            }
+            if (budget) {
+                used += budget.sizeOf(entry[0]);
+                if (used > budget.bytes) {
+                    slots = 0;
+                    continue;
+                }
+            }
+            slots--;
+        }
+        kept.push(entry);
     }
 
     if (pool <= 0 || kept.length === 0) {
@@ -161,6 +178,7 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
     const fee = Number(BigInt(sharedPool) * BigInt(p.feePpm) / 1_000_000n);
     const splitPool = sharedPool - fee;
 
+    const fixed = new Set([p.finderAddress, ...(fee > 0 ? [p.feeAddress] : [])]);
     let budget: { bytes: number, sizeOf: (address: string) => number } = undefined;
     if (p.maxOutputBytes != null) {
         if (!p.outputBytes) {
@@ -169,17 +187,16 @@ export function buildPayouts(p: IPayoutParams): IPayoutResult {
         assertSats('maxOutputBytes', p.maxOutputBytes);
         // Fee and finder outputs are always present; a miner who is also the
         // fee or finder address merges into that output and costs nothing.
-        const fixed = new Set([p.finderAddress, ...(fee > 0 ? [p.feeAddress] : [])]);
         let fixedBytes = 0;
         for (const a of fixed) {
             fixedBytes += p.outputBytes(a);
         }
         budget = {
             bytes: Math.max(0, p.maxOutputBytes - fixedBytes),
-            sizeOf: (a: string) => (fixed.has(a) ? 0 : p.outputBytes(a)),
+            sizeOf: p.outputBytes,
         };
     }
-    const { paid, dropped } = splitByWork(splitPool, p.window, Math.max(1, p.minPayoutSats), p.maxSplitOutputs, budget);
+    const { paid, dropped } = splitByWork(splitPool, p.window, Math.max(1, p.minPayoutSats), p.maxSplitOutputs, budget, fixed);
     let splitPaid = 0;
     for (const v of paid.values()) {
         splitPaid += v;

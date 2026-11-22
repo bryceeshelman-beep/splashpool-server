@@ -56,7 +56,7 @@ function jobTemplate(reward: number, extraTxs = 0): IJobTemplate {
     return {
         block,
         merkle_branch: [],
-        blockData: { id: '1', creation: Date.now(), coinbasevalue: reward, networkDifficulty: 1, height: 162300, clearJobs: true },
+        blockData: { id: '1', creation: Date.now(), coinbasevalue: reward, networkDifficulty: 1, height: 162300, mintime: 0, clearJobs: true },
     };
 }
 
@@ -79,7 +79,7 @@ describe('Splash coinbase', () => {
         const reward = 5_000_000_000;
         const outputs = s.outputsFor(FINDER, reward);
         const tpl = jobTemplate(reward);
-        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, tpl);
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '-=+SplashPool+=-' }), net, '1', outputs, tpl);
         const cb = job.cloneCoinbaseTransaction();
 
         // Payout outputs, then the witness commitment last.
@@ -104,8 +104,8 @@ describe('Splash coinbase', () => {
         expect(cb.outs[1].value).toBeGreaterThanOrEqual(112_500_000);
         expect(cb.outs[1].value).toBeLessThan(112_500_000 + miners.length);
 
-        // Block identity: the coinbase scriptSig carries the /Splashpool/ tag.
-        expect(cb.ins[0].script.toString('latin1')).toContain('/Splashpool/');
+        // Block identity: the coinbase scriptSig carries the -=+SplashPool+=- tag.
+        expect(cb.ins[0].script.toString('latin1')).toContain('-=+SplashPool+=-');
 
         // Every address type got paid.
         for (const a of Object.values(ADDR)) {
@@ -180,7 +180,7 @@ describe('Splash coinbase', () => {
         // A template already filled to (4,000,000 - 50,000) weight, as bitcoind
         // builds it with blockreservedweight=50000.
         const tpl = jobTemplate(reward, Math.floor((4_000_000 - 50_000) / FILLER_WU));
-        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, tpl);
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '-=+SplashPool+=-' }), net, '1', outputs, tpl);
         expect(job.cloneCoinbaseTransaction().weight()).toBeLessThan(50_000);
     });
 
@@ -207,7 +207,7 @@ describe('Splash coinbase', () => {
         const bytes = outputs.reduce((n, o) => n + s.outputBytes(o.address), 0);
         expect(bytes).toBeLessThanOrEqual(5000);
         expect(outputs.length).toBe(2 + Math.floor((5000 - 62) / 43));
-        const job = new MiningJob(config({ POOL_IDENTIFIER: '/Splashpool/' }), net, '1', outputs, jobTemplate(5_000_000_000));
+        const job = new MiningJob(config({ POOL_IDENTIFIER: '-=+SplashPool+=-' }), net, '1', outputs, jobTemplate(5_000_000_000));
         // coinb2 in mining.notify; 12,142 hex chars ran fine on both firmwares, 13,002 crashed them.
         expect((job as any).coinbasePart2.length).toBeLessThan(10_400);
         // The largest miners are the ones kept.

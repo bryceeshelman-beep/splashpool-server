@@ -1,7 +1,7 @@
-import { AddressType, getAddressInfo } from 'bitcoin-address-validation';
 import * as bitcoinjs from 'bitcoinjs-lib';
 
 import { IJobTemplate } from '../services/stratum-v1-jobs.service';
+import { payoutScript } from '../splash/payout-script';
 import { eResponseMethod } from './enums/eResponseMethod';
 import { IMiningNotify } from './stratum-messages/IMiningNotify';
 import { ConfigService } from '@nestjs/config';
@@ -89,7 +89,7 @@ export class MiningJob {
 
         // Build the script
         let script = Buffer.concat([blockHeightLengthByte, blockHeightEncoded, extra, padding]);
-        // Splash Pool: the pool tag (/Splashpool/) is in EVERY coinbase. An
+        // Splash Pool: the pool tag (-=+SplashPool+=-) is in EVERY coinbase. An
         // identifier that doesn't fit is a configuration error, so refuse the
         // job instead of silently mining an untagged block.
         if (script.length > MAX_SCRIPT_SIZE) {
@@ -97,6 +97,9 @@ export class MiningJob {
         }
 
         this.coinbaseTransaction.ins[0].script = script;
+        // Every job is different work, so one hash can't be claimed under two
+        // jobs' difficulties. nSequence is free in a coinbase (nLockTime is 0).
+        this.coinbaseTransaction.ins[0].sequence = parseInt(jobId, 16) >>> 0;
         this.coinbaseTransaction.addOutput(bitcoinjs.script.compile([bitcoinjs.opcodes.OP_RETURN, Buffer.concat([segwitMagicBits, jobTemplate.block.witnessCommit])]), 0);
 
         // Splash Pool: a large payout coinbase must still fit. Refuse the job
@@ -248,38 +251,13 @@ export class MiningJob {
         const key = `${this.network.bech32}|${address}`;
         let script = scriptCache.get(key);
         if (script == null) {
-            script = this.buildPaymentScript(address);
+            script = payoutScript(address, this.network);
             if (scriptCache.size > 100_000) {
                 scriptCache.clear();
             }
             scriptCache.set(key, script);
         }
         return script;
-    }
-
-    private buildPaymentScript(address: string): Buffer {
-        const addressInfo = getAddressInfo(address);
-        switch (addressInfo.type) {
-            case AddressType.p2wpkh: {
-                return bitcoinjs.payments.p2wpkh({ address, network: this.network }).output;
-            }
-            case AddressType.p2pkh: {
-                return bitcoinjs.payments.p2pkh({ address, network: this.network }).output;
-            }
-            case AddressType.p2sh: {
-                return bitcoinjs.payments.p2sh({ address, network: this.network }).output;
-            }
-            case AddressType.p2tr: {
-                return bitcoinjs.payments.p2tr({ address, network: this.network }).output;
-            }
-            case AddressType.p2wsh: {
-                return bitcoinjs.payments.p2wsh({ address, network: this.network }).output;
-            }
-            default: {
-                // Never pay an empty script: anyone could spend it.
-                throw new Error(`Unsupported payout address type for ${address}`);
-            }
-        }
     }
 
     public response(jobTemplate: IJobTemplate): string {

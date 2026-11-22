@@ -2,14 +2,11 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Interval } from '@nestjs/schedule';
 import * as bitcoinjs from 'bitcoinjs-lib';
-import * as ecc from 'tiny-secp256k1';
+import { ReplaySubject } from 'rxjs';
 
 import { ShareWindowService } from '../ORM/share-window/share-window.service';
 import { buildPayouts, IPayoutResult, IWindowWork } from './payout-builder';
-
-// Taproot (bc1p/tb1p) addresses need the ECC library. main.ts also sets it up;
-// doing it here too means this module never depends on that hidden setup.
-bitcoinjs.initEccLib(ecc);
+import { payoutScript } from './payout-script';
 
 export function networkFromConfig(networkConfig: string): bitcoinjs.networks.Network {
     switch (networkConfig) {
@@ -20,10 +17,10 @@ export function networkFromConfig(networkConfig: string): bitcoinjs.networks.Net
     }
 }
 
-/** True when `address` decodes to a standard output script on `network`. */
+/** True when the coinbase can pay `address` on `network`. */
 export function isPayableAddress(address: string, network: bitcoinjs.networks.Network): boolean {
     try {
-        return bitcoinjs.address.toOutputScript(address, network).length > 0;
+        return payoutScript(address, network).length > 0;
     } catch {
         return false;
     }
@@ -60,6 +57,8 @@ export class PayoutService implements OnModuleInit {
 
     private snapshot: IWindowWork[] = [];
     private snapshotAt: Date = null;
+    /** Fires after the first successful window read, and for later subscribers. */
+    public readonly ready$ = new ReplaySubject<void>(1);
     private lastReward: number = null;
 
     constructor(
@@ -129,16 +128,31 @@ export class PayoutService implements OnModuleInit {
             }
             this.snapshot = Array.from(merged, ([address, difficulty]) => ({ address, difficulty }))
                 .sort((a, b) => b.difficulty - a.difficulty || (a.address < b.address ? -1 : a.address > b.address ? 1 : 0));
+            const wasReady = this.ready;
             this.snapshotAt = new Date();
             this.outputsCache.clear();
+            if (!wasReady) {
+                this.ready$.next();
+            }
         } catch (e) {
             // Keep the previous snapshot; a stale split is better than none.
-            console.error('Splash: share window refresh failed, keeping previous snapshot', e);
+            // With no previous snapshot there is no split, so there are no jobs.
+            console.error(this.ready
+                ? 'Splash: share window refresh failed, keeping previous snapshot'
+                : 'Splash: share window not read yet, holding all jobs (retry in 30s)', e);
         }
+    }
+
+    /** False until the window has been read once. An unread window is not an empty one. */
+    public get ready(): boolean {
+        return this.snapshotAt != null;
     }
 
     /** The reward split for a block found by `finderAddress`. */
     public build(finderAddress: string, reward: number): IPayoutResult {
+        if (!this.ready) {
+            throw new Error('Splash payouts not ready: the share window has not been read yet');
+        }
         this.lastReward = reward;
         return buildPayouts({
             reward,
@@ -177,6 +191,7 @@ export class PayoutService implements OnModuleInit {
     public status() {
         return {
             enabled: this.enabled,
+            ready: this.ready,
             feeAddress: this.feeAddress,
             feePpm: this.feePpm,
             feePercentOfShared: this.feePpm / 10000,
@@ -196,7 +211,7 @@ export class PayoutService implements OnModuleInit {
     public outputBytes(address: string): number {
         let n = this.scriptSizes.get(address);
         if (n == null) {
-            const script = bitcoinjs.address.toOutputScript(address, this.network).length;
+            const script = payoutScript(address, this.network).length;
             n = 8 + (script < 253 ? 1 : 3) + script;
             if (this.scriptSizes.size > 100_000) {
                 this.scriptSizes.clear();

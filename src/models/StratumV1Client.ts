@@ -4,7 +4,7 @@ import { plainToInstance } from 'class-transformer';
 import { validate, ValidationError, ValidatorOptions } from 'class-validator';
 import * as crypto from 'crypto';
 import { Socket } from 'net';
-import { firstValueFrom, Subscription } from 'rxjs';
+import { firstValueFrom, Subscription, switchMap } from 'rxjs';
 import { clearInterval } from 'timers';
 
 import { AddressSettingsService } from '../ORM/address-settings/address-settings.service';
@@ -29,10 +29,16 @@ import { SuggestDifficulty } from './stratum-messages/SuggestDifficultyMessage';
 import { StratumV1ClientStatistics } from './StratumV1ClientStatistics';
 import { ExternalSharesService } from '../services/external-shares.service';
 import { ShareWindowService } from '../ORM/share-window/share-window.service';
+import { settleBlock, submitBlock } from '../splash/block-submission';
 import { PayoutService } from '../splash/payout.service';
 
 const TRUE_DIFF_ONE = 2.695953529101131e67;
 const BLOCKED_USER_AGENT_LOG_INTERVAL_MS = 60 * 1000;
+// Consensus: a block may be at most two hours ahead of the node's clock.
+const MAX_FUTURE_BLOCK_SECONDS = 2 * 60 * 60;
+// Stratum messages are under 1 KB.
+const MAX_LINE_LENGTH = 16 * 1024;
+const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const VALIDATION_ERROR_LOG_INTERVAL_MS = 60 * 1000;
 
 export class StratumV1Client {
@@ -69,7 +75,11 @@ export class StratumV1Client {
     private connectionClosed = false;
     private lastSentMiningJobTimestamp: number = null;
 
-    private miningSubmissionHashes = new Set<string>()
+    private miningSubmissionHeaders = new Set<string>()
+    // This connection's jobs and the difficulty each was issued at. A share is
+    // judged and credited only by that, never by the current session difficulty.
+    private issuedJobs = new Map<string, number>();
+    private pendingInputBytes = 0;
 
     constructor(
         public readonly socket: Socket,
@@ -87,9 +97,20 @@ export class StratumV1Client {
     ) {
 
         this.socket.on('data', (data: Buffer) => {
+            if (this.connectionClosed) {
+                return;
+            }
             this.buffer += data.toString();
             let lines = this.buffer.split('\n');
             this.buffer = lines.pop() || ''; // Save the last part of the data (incomplete line) to the buffer
+            this.pendingInputBytes += data.length;
+            if (this.pendingInputBytes > MAX_PENDING_INPUT_BYTES
+                || this.buffer.length > MAX_LINE_LENGTH
+                || lines.some(l => l.length > MAX_LINE_LENGTH)) {
+                this.buffer = '';
+                this.closeSocket();
+                return;
+            }
 
             (async () => {
                 for (const m of lines.filter(l => l.length > 0)) {
@@ -103,6 +124,7 @@ export class StratumV1Client {
                         console.error(e);
                     }
                 }
+                this.pendingInputBytes -= data.length;
             })();
         });
 
@@ -247,8 +269,10 @@ export class StratumV1Client {
                 const errors = await validate(authorizationMessage, validatorOptions);
 
                 if (errors.length === 0) {
+                    const firstLogin = this.clientAuthorization == null;
                     this.clientAuthorization = authorizationMessage;
-                    if (this.clientSuggestedDifficulty == null && this.clientAuthorization.startingDiff != null && this.clientAuthorization.startingDiff > this.sessionDifficulty) {
+                    // d= sets the starting difficulty only, so only the first login counts.
+                    if (firstLogin && this.clientSuggestedDifficulty == null && this.clientAuthorization.startingDiff != null && this.clientAuthorization.startingDiff > this.sessionDifficulty) {
                         this.sessionDifficulty = this.clientAuthorization.startingDiff;
                     }
                     const success = await this.write(JSON.stringify(this.clientAuthorization.response()) + '\n');
@@ -289,14 +313,23 @@ export class StratumV1Client {
                 const errors = await validate(suggestDifficultyMessage, validatorOptions);
 
                 if (errors.length === 0) {
-
+                    // Checked again: two can arrive together and both pass the check above.
+                    if (this.usedSuggestedDifficulty) {
+                        return;
+                    }
+                    this.usedSuggestedDifficulty = true;
+                    const previousDifficulty = this.sessionDifficulty;
                     this.clientSuggestedDifficulty = suggestDifficultyMessage;
                     this.sessionDifficulty = this.clampDifficulty(suggestDifficultyMessage.suggestedDifficulty);
                     const success = await this.write(JSON.stringify(this.clientSuggestedDifficulty.response(this.sessionDifficulty)) + '\n');
                     if (!success) {
                         return;
                     }
-                    this.usedSuggestedDifficulty = true;
+                    // AxeOS suggests after login, so after its first job. That job keeps
+                    // its difficulty, so send one that carries the new one.
+                    if (this.issuedJobs.size > 0 && this.sessionDifficulty !== previousDifficulty) {
+                        await this.sendRefreshedJob();
+                    }
                 } else {
                     console.error('Suggest difficulty validation error');
                     const err = new StratumErrorMessage(
@@ -402,10 +435,16 @@ export class StratumV1Client {
             }
         }
 
-        this.stratumSubscription = this.stratumV1JobsService.newMiningJob$.subscribe(async (jobTemplate) => {
+        // No jobs until the share window has been read. Waiting miners then get
+        // the current template at once.
+        const jobs$ = this.payoutService?.enabled
+            ? this.payoutService.ready$.pipe(switchMap(() => this.stratumV1JobsService.newMiningJob$))
+            : this.stratumV1JobsService.newMiningJob$;
+        this.stratumSubscription = jobs$.subscribe(async (jobTemplate) => {
             try {
                 if(jobTemplate.blockData.clearJobs){
-                    this.miningSubmissionHashes.clear();
+                    this.miningSubmissionHeaders.clear();
+                    this.issuedJobs.clear();
                 }
                 await this.sendNewMiningJob(jobTemplate);
             } catch (e) {
@@ -440,8 +479,7 @@ export class StratumV1Client {
             this.noFee = this.hashRate != 0 && this.hashRate < 50000000000000;
         }
         if (this.payoutService?.enabled) {
-            // Splash Pool: this miner's Splash Bonus as finder, the fee, and the 3-day window split.
-            payoutInformation = this.payoutService.outputsFor(this.clientAuthorization.address, jobTemplate.blockData.coinbasevalue);
+            // Splash Pool: exact outputs, built below.
         } else if (this.noFee || devFeeAddress == null || devFeeAddress.length < 1) {
             payoutInformation = [
                 { address: this.clientAuthorization.address, percent: 100 }
@@ -467,15 +505,28 @@ export class StratumV1Client {
             throw new Error('Invalid network configuration');
         }
 
-        const job = new MiningJob(
-            this.configService,
-            network,
-            this.stratumV1JobsService.getNextId(),
-            payoutInformation,
-            jobTemplate
-        );
+        let job: MiningJob;
+        try {
+            if (this.payoutService?.enabled) {
+                // This miner's Splash Bonus as finder, the fee, and the 3-day window split.
+                payoutInformation = this.payoutService.outputsFor(this.clientAuthorization.address, jobTemplate.blockData.coinbasevalue);
+            }
+            job = new MiningJob(
+                this.configService,
+                network,
+                this.stratumV1JobsService.getNextId(),
+                payoutInformation,
+                jobTemplate
+            );
+        } catch (e) {
+            // Backstop: drop this connection only, and never fall back to another payout.
+            console.error(`Splash: no job built for ${this.clientAuthorization.address}, closing its connection`, e);
+            this.closeSocket();
+            return;
+        }
 
         this.stratumV1JobsService.addJob(job);
+        this.issuedJobs.set(job.jobId, this.sessionDifficulty);
 
 
         const success = await this.write(job.response(jobTemplate));
@@ -513,7 +564,9 @@ export class StratumV1Client {
 
     private async handleMiningSubmission(submission: MiningSubmitMessage) {
 
-        const job = this.stratumV1JobsService.getJobById(submission.jobId);
+        const issuedDifficulty = this.issuedJobs.get(submission.jobId);
+        // Another connection's job is "not found" here.
+        const job = issuedDifficulty == null ? null : this.stratumV1JobsService.getJobById(submission.jobId);
 
         // a miner may submit a job that doesn't exist anymore if it was removed by a new block notification (or expired, 5 min)
         if (job == null) {
@@ -549,14 +602,72 @@ export class StratumV1Client {
             return false;
         }
 
-        const submissionHash = [
-            submission.jobId,
-            submission.extraNonce2,
-            submission.ntime,
-            submission.nonce,
-            submission.versionMask ?? ''
-        ].join(':');
-        if (this.miningSubmissionHashes.has(submissionHash)) {
+        // All strict hex (MiningSubmitMessage). Only these parsed values are used below.
+        const extraNonce2 = submission.extraNonce2.toLowerCase();
+        let versionMask = parseInt(submission.versionMask, 16);
+        const nonce = parseInt(submission.nonce, 16);
+        const timestamp = parseInt(submission.ntime, 16);
+
+        // Work that could never be a valid block earns nothing.
+        let invalid: string = null;
+        if (timestamp < jobTemplate.blockData.mintime || timestamp > Math.floor(Date.now() / 1000) + MAX_FUTURE_BLOCK_SECONDS) {
+            invalid = 'Invalid ntime';
+        } else if ((versionMask & ~VERSION_ROLLING_MASK) !== 0) {
+            invalid = 'Invalid version bits';
+        }
+        if (invalid != null) {
+            if (this.noteShareResult(false)) {
+                return false;
+            }
+            await this.write(new StratumErrorMessage(submission.id, eStratumErrorCode.OtherUnknown, invalid).response());
+            return false;
+        }
+
+        // A block always counts, so the chance of a share is set by the lower of
+        // the two difficulties, and so is the credit.
+        const shareDifficulty = Math.min(issuedDifficulty, jobTemplate.blockData.networkDifficulty);
+
+        const header = job.buildHeaderBuffer(
+            jobTemplate,
+            versionMask,
+            nonce,
+            this.extraNonceAndSessionId,
+            extraNonce2,
+            timestamp
+        );
+        let { submissionDifficulty } = this.calculateDifficulty(header);
+        let finalHeader = header;
+
+        // Splash Pool: firmware disagrees on what the submitted version bits mean.
+        // Bitaxe-style firmware sends only the bits it flipped (XOR, above); BIP310
+        // firmware (e.g. the Hammer) sends the full rolled bits. The two only differ
+        // when the template version already has a bit inside the rolling mask, as
+        // in any soft-fork signalling period. Try the BIP310 reading, expressed as
+        // the equivalent XOR mask, before calling the share low.
+        if (submissionDifficulty < shareDifficulty && versionMask) {
+            const bip310Mask = bip310XorMask(jobTemplate.block.version, versionMask);
+            if (bip310Mask !== versionMask) {
+                const altHeader = job.buildHeaderBuffer(
+                    jobTemplate,
+                    bip310Mask,
+                    nonce,
+                    this.extraNonceAndSessionId,
+                    extraNonce2,
+                    timestamp
+                );
+                const alt = this.calculateDifficulty(altHeader).submissionDifficulty;
+                if (alt > submissionDifficulty) {
+                    submissionDifficulty = alt;
+                    versionMask = bip310Mask;
+                    finalHeader = altHeader;
+                }
+            }
+        }
+
+        // One header is one piece of work, however it was spelled and whichever
+        // job id it came under. So this check has to follow the BIP310 fallback.
+        const headerKey = finalHeader.toString('base64');
+        if (this.miningSubmissionHeaders.has(headerKey)) {
             const err = new StratumErrorMessage(
                 submission.id,
                 eStratumErrorCode.DuplicateShare,
@@ -569,54 +680,15 @@ export class StratumV1Client {
                 return false;
             }
             return false;
-        } else {
-            this.miningSubmissionHashes.add(submissionHash);
         }
-
-        let versionMask = parseInt(submission.versionMask, 16);
-        const nonce = parseInt(submission.nonce, 16);
-        const timestamp = parseInt(submission.ntime, 16);
-
-        const header = job.buildHeaderBuffer(
-            jobTemplate,
-            versionMask,
-            nonce,
-            this.extraNonceAndSessionId,
-            submission.extraNonce2,
-            timestamp
-        );
-        let { submissionDifficulty } = this.calculateDifficulty(header);
-
-        // Splash Pool: firmware disagrees on what the submitted version bits mean.
-        // Bitaxe-style firmware sends only the bits it flipped (XOR, above); BIP310
-        // firmware (e.g. the Hammer) sends the full rolled bits. The two only differ
-        // when the template version already has a bit inside the rolling mask, as
-        // in any soft-fork signalling period. Try the BIP310 reading, expressed as
-        // the equivalent XOR mask, before calling the share low.
-        if (submissionDifficulty < this.sessionDifficulty && versionMask) {
-            const bip310Mask = bip310XorMask(jobTemplate.block.version, versionMask);
-            if (bip310Mask !== versionMask) {
-                const alt = this.calculateDifficulty(job.buildHeaderBuffer(
-                    jobTemplate,
-                    bip310Mask,
-                    nonce,
-                    this.extraNonceAndSessionId,
-                    submission.extraNonce2,
-                    timestamp
-                )).submissionDifficulty;
-                if (alt > submissionDifficulty) {
-                    submissionDifficulty = alt;
-                    versionMask = bip310Mask;
-                }
-            }
-        }
+        this.miningSubmissionHeaders.add(headerKey);
 
         //console.log(`DIFF: ${submissionDifficulty} of ${this.sessionDifficulty} from ${this.clientAuthorization.worker + '.' + this.extraNonceAndSessionId}`);
 
 
         // A block solution is always accepted, even below the session difficulty
         // (possible on test networks, where blocks can be easier than the floor).
-        if (submissionDifficulty >= this.sessionDifficulty || submissionDifficulty >= jobTemplate.blockData.networkDifficulty) {
+        if (submissionDifficulty >= shareDifficulty) {
             this.noteShareResult(true);
             const success = await this.write(JSON.stringify(submission.response()) + '\n');
             if (!success) {
@@ -625,7 +697,7 @@ export class StratumV1Client {
 
             // Splash Pool: credit this share to the 3-day window before any
             // block handling, so a block-finding share counts too.
-            this.shareWindowService?.recordShare(this.clientAuthorization.address, this.sessionDifficulty, Date.now(), this.clientAuthorization.worker);
+            this.shareWindowService?.recordShare(this.clientAuthorization.address, shareDifficulty, Date.now(), this.clientAuthorization.worker);
 
             if (submissionDifficulty >= jobTemplate.blockData.networkDifficulty) {
                 console.log('!!! BLOCK FOUND !!!');
@@ -634,28 +706,46 @@ export class StratumV1Client {
                     versionMask,
                     nonce,
                     this.extraNonceAndSessionId,
-                    submission.extraNonce2,
+                    extraNonce2,
                     timestamp
                 );
                 const blockHex = updatedJobBlock.toHex(false);
-                const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
-                await this.blocksService.save({
-                    height: jobTemplate.blockData.height,
-                    minerAddress: this.clientAuthorization.address,
-                    worker: this.clientAuthorization.worker,
-                    sessionId: this.extraNonceAndSessionId,
-                    blockData: blockHex
-                });
+                const height = jobTemplate.blockData.height;
+                const block = { hex: blockHex, hash: updatedJobBlock.getId(), height };
+                // Logged before submitting: a block that isn't accepted is only kept here.
+                console.log(`Submitting block ${block.hash} at height ${height}: ${blockHex}`);
+                const { address, worker } = this.clientAuthorization;
+                const sessionId = this.extraNonceAndSessionId;
+                const recordFound = async (response: string) => {
+                    await this.blocksService.save({ height, minerAddress: address, worker, sessionId, blockData: blockHex });
+                    await this.notificationService.notifySubscribersBlockFound(address, height, updatedJobBlock, response);
+                };
 
-                await this.notificationService.notifySubscribersBlockFound(this.clientAuthorization.address, jobTemplate.blockData.height, updatedJobBlock, result);
+                const { outcome, response: result } = await submitBlock(this.bitcoinRpcService, block);
+                if (outcome === 'accepted') {
+                    await recordFound(result);
+                } else {
+                    console.error(`Block ${block.hash} not recorded as found (${outcome}): ${result}`);
+                }
+                if (outcome === 'unknown') {
+                    // In the background, so the miner isn't held up and may disconnect.
+                    void settleBlock(this.bitcoinRpcService, block)
+                        .then(async settled => {
+                            console.log(`Block ${block.hash} settled as ${settled.outcome}: ${settled.response}`);
+                            if (settled.outcome === 'accepted') {
+                                await recordFound(settled.response);
+                            }
+                        })
+                        .catch(e => console.error(`Block ${block.hash}: follow-up failed`, e));
+                }
                 //success
-                if (result == null) {
+                if (outcome === 'accepted' && result == null) {
                     await this.addressSettingsService.resetBestDifficultyAndShares();
                 }
             }
             await this.ensureClientEntity();
             try {
-                await this.statistics.addShares(this.entity, this.sessionDifficulty);
+                await this.statistics.addShares(this.entity, shareDifficulty);
                 const now = new Date();
                 // only update every minute
                 if (this.entity.updatedAt == null || now.getTime() - this.entity.updatedAt.getTime() > 1000 * 60) {
@@ -682,7 +772,7 @@ export class StratumV1Client {
                     worker: this.clientAuthorization.worker,
                     address: this.clientAuthorization.address,
                     userAgent: this.clientSubscription.userAgent,
-                    header: header.toString('hex'),
+                    header: finalHeader.toString('hex'),
                     externalPoolName: this.configService.get('POOL_IDENTIFIER') || 'Public-Pool'
                 });
             }
@@ -740,6 +830,10 @@ export class StratumV1Client {
     }
 
     private async checkDifficulty() {
+        // While jobs are held there is no work to retarget, and a retarget sends a job.
+        if (this.payoutService?.enabled && !this.payoutService.ready) {
+            return;
+        }
         const suggested = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
         if (suggested == null) {
             return;
@@ -758,25 +852,28 @@ export class StratumV1Client {
 
 
             await this.socket.write(data);
-
-            const jobTemplate = await firstValueFrom(this.stratumV1JobsService.newMiningJob$);
-            const nextTimestamp = Math.max(
-                jobTemplate.block.timestamp,
-                Math.floor(Date.now() / 1000),
-                (this.lastSentMiningJobTimestamp ?? 0) + 1
-            );
-            // We need to clear jobs so the difficulty takes effect, but avoid mutating or
-            // re-sending the shared cached template with byte-identical work.
-            const refreshedJobTemplate: IJobTemplate = {
-                ...jobTemplate,
-                block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
-                    timestamp: nextTimestamp
-                }),
-                blockData: { ...jobTemplate.blockData, clearJobs: true }
-            };
-            await this.sendNewMiningJob(refreshedJobTemplate);
-
+            await this.sendRefreshedJob();
         }
+    }
+
+    /** New work at the current difficulty, outside the template cycle. */
+    private async sendRefreshedJob() {
+        const jobTemplate = await firstValueFrom(this.stratumV1JobsService.newMiningJob$);
+        const nextTimestamp = Math.max(
+            jobTemplate.block.timestamp,
+            Math.floor(Date.now() / 1000),
+            (this.lastSentMiningJobTimestamp ?? 0) + 1
+        );
+        // We need to clear jobs so the difficulty takes effect, but avoid mutating or
+        // re-sending the shared cached template with byte-identical work.
+        const refreshedJobTemplate: IJobTemplate = {
+            ...jobTemplate,
+            block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
+                timestamp: nextTimestamp
+            }),
+            blockData: { ...jobTemplate.blockData, clearJobs: true }
+        };
+        await this.sendNewMiningJob(refreshedJobTemplate);
     }
 
     private calculateDifficulty(header: Buffer): { submissionDifficulty: number, submissionHash: string } {

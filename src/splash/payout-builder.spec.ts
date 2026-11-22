@@ -220,6 +220,30 @@ describe('output byte budget', () => {
         }
     });
 
+    it.each(['FINDER', 'FEE'])('keeps the split of %s when ranked below the byte cut', (who) => {
+        const w = [...window, { address: who, difficulty: 900 }]; // below all 50 others
+        const r = buildPayouts(base({ window: w, maxOutputBytes: 31 * 3 + 43, outputBytes: size }));
+        expect(r.outputs.map(o => o.address).sort()).toEqual(['FEE', 'FINDER', 'T1', 'W0']);
+        expect(r.outputs.find(o => o.address === who).split).toBe(Math.floor(r.splitPool * (900 / (1000 + 999 + 900))));
+        expect(sum(r)).toBe(r.reward);
+    });
+
+    it('keeps finder and fee below the count cut, inside the same cap', () => {
+        const w = [...window, { address: 'FINDER', difficulty: 900 }, { address: 'FEE', difficulty: 890 }];
+        const r = buildPayouts(base({ window: w, maxSplitOutputs: 3 }));
+        expect(r.outputs.filter(o => o.split > 0).map(o => o.address).sort()).toEqual(['FEE', 'FINDER', 'W0']);
+    });
+
+    it.each([{ maxSplitOutputs: 0 }, { maxOutputBytes: 0, outputBytes: size }])('always has finder and fee outputs: %o', (limit) => {
+        const r = buildPayouts(base({ window, ...limit }));
+        expect(r.outputs.map(o => o.address)).toEqual(['FEE', 'FINDER']);
+    });
+
+    it('still applies the minimum payout to the finder', () => {
+        const r = buildPayouts(base({ window: [...window, { address: 'FINDER', difficulty: 0.001 }] }));
+        expect(r.outputs.find(o => o.address === 'FINDER').split).toBe(0);
+    });
+
     it('needs a size function', () => {
         expect(() => buildPayouts(base({ maxOutputBytes: 100 }))).toThrow(/outputBytes/);
     });

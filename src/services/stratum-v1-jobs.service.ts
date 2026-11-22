@@ -17,6 +17,7 @@ export interface IJobTemplate {
         coinbasevalue: number;
         networkDifficulty: number;
         height: number;
+        mintime: number;
         clearJobs: boolean;
     };
 }
@@ -92,11 +93,12 @@ export class StratumV1JobsService {
                     timestamp,
                     networkDifficulty: this.calculateNetworkDifficulty(parseInt(blockTemplate.bits, 16)),
                     clearJobs,
-                    height: blockTemplate.height
+                    height: blockTemplate.height,
+                    mintime: blockTemplate.mintime
                 };
             }),
             filter(next => next != null),
-            map(({ version, bits, prevHash, transactions, timestamp, coinbasevalue, networkDifficulty, clearJobs, height }) => {
+            map(({ version, bits, prevHash, transactions, timestamp, coinbasevalue, networkDifficulty, clearJobs, height, mintime }) => {
                 const block = new bitcoinjs.Block();
 
                 //create an empty coinbase tx
@@ -134,6 +136,7 @@ export class StratumV1JobsService {
                         coinbasevalue,
                         networkDifficulty,
                         height,
+                        mintime,
                         clearJobs
                     }
                 }

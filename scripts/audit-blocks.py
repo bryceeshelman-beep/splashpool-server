@@ -11,7 +11,7 @@ Rules checked per block:
   - first output = fee address, exactly floor((reward - bonus) * 0.125%)
   - second output = the finder the pool recorded for that height (pool DB),
     paid at least the Splash Bonus
-  - coinbase scriptSig carries the /Splashpool/ tag
+  - coinbase scriptSig carries the -=+SplashPool+=- tag
   - no address paid twice; every split output >= 10,000 sats
   - witness commitment is the last output, value 0
   - outputs sum to the reward (subsidy + fees, as the chain accepted it)
@@ -27,7 +27,7 @@ ap.add_argument('--datadir', default=os.environ.get('BITCOIN_DATADIR', os.path.e
 ap.add_argument('--fee', default='tb1q29suxu0226smyuy4zrkggelksx6aqe0u3t47ca')
 ap.add_argument('--pool-db', default=None)
 ap.add_argument('--share-log', default=None)
-ap.add_argument('--tag', default='/Splashpool/', help='coinbase tag every block must carry')
+ap.add_argument('--tag', default='-=+SplashPool+=-', help='coinbase tag every block must carry')
 ap.add_argument('--bonus', type=int, default=112_500_000, help='Splash Bonus in sats')
 ap.add_argument('--fee-ppm', type=int, default=1250, help='fee on the shared portion, parts per million')
 ap.add_argument('--quiet', action='store_true', help='only print problem blocks and the summary')

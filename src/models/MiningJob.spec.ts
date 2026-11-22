@@ -141,10 +141,10 @@ describe('MiningJob', () => {
             expect(console.warn).not.toBeCalled();
         });
 
-        it('Splash: /Splashpool/ is in the coinbase of a full mainnet-size template', () => {
+        it('Splash: -=+SplashPool+=- is in the coinbase of a full mainnet-size template', () => {
             configService.get = jest.fn((key: string) => {
                 switch (key) {
-                    case 'POOL_IDENTIFIER': return '/Splashpool/';
+                    case 'POOL_IDENTIFIER': return '-=+SplashPool+=-';
                 }
                 return null;
             });
@@ -152,8 +152,8 @@ describe('MiningJob', () => {
             const miningJob = new MiningJob(configService, bitcoinjs.networks.testnet, '1', payoutInformation, jobTemplate);
             const response = JSON.parse(miningJob.response(jobTemplate));
 
-            expect(extractPoolIdentifierFromScript(response.params[2])).toBe('/Splashpool/');
-            expect(response.params[2]).toContain(Buffer.from('/Splashpool/').toString('hex'));
+            expect(extractPoolIdentifierFromScript(response.params[2])).toBe('-=+SplashPool+=-');
+            expect(response.params[2]).toContain(Buffer.from('-=+SplashPool+=-').toString('hex'));
             expect(console.warn).not.toBeCalled();
         });
 

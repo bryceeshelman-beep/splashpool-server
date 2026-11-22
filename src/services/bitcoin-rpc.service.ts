@@ -185,11 +185,10 @@ export class BitcoinRpcService implements OnModuleInit {
                 response = 'SUCCESS!';
             }
             console.log(`BLOCK SUBMISSION RESPONSE: ${response}`);
-            console.log(hexdata);
-            console.log(JSON.stringify(response));
         } catch (e) {
-            response = e;
-            console.log(`BLOCK SUBMISSION RESPONSE ERROR: ${e}`);
+            // A failed call is not an answer: the node may or may not have the block.
+            response = `RPC_ERROR: ${e?.message ?? e}`;
+            console.log(`BLOCK SUBMISSION ${response}`);
         }
         return response;
 

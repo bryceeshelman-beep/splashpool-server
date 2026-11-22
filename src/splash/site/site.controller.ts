@@ -1,5 +1,6 @@
 import { Controller, Get, Param } from '@nestjs/common';
 
+import { poolStatsFrom } from './pool-stats';
 import { SiteService } from './site.service';
 
 // Read-only endpoints for the public website. Only /api/site/* is exposed
@@ -12,6 +13,12 @@ export class SiteController {
     @Get('summary')
     summary() {
         return this.siteService.summary();
+    }
+
+    // Aggregate stats for pool-listing sites (MiningPoolStats). No addresses.
+    @Get('poolstats')
+    async poolStats() {
+        return poolStatsFrom(await this.siteService.summary());
     }
 
     @Get('blocks')

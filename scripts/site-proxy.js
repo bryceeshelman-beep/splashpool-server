@@ -3,7 +3,7 @@
 //
 // The Cloudflare tunnel points here, never at the pool API directly. Only
 // read-only GET requests to the website endpoints pass through:
-//   /api/site/summary  /api/site/blocks  /api/site/block/<height>  /api/site/address/<addr>
+//   /api/site/summary  /api/site/poolstats  /api/site/blocks  /api/site/block/<height>  /api/site/address/<addr>
 // Everything else (the pool's write endpoints, other read endpoints) gets 404.
 //
 // Env: LISTEN_PORT (3340), LISTEN_HOST (127.0.0.1), UPSTREAM (http://127.0.0.1:3334),
@@ -21,6 +21,7 @@ const MAX_BODY = 8 * 1024 * 1024;
 
 const ROUTES = [
     { re: /^\/api\/site\/summary$/, maxAge: 15 },
+    { re: /^\/api\/site\/poolstats$/, maxAge: 30 },
     { re: /^\/api\/site\/blocks$/, maxAge: 30 },
     { re: /^\/api\/site\/block\/[0-9]{1,8}$/, maxAge: 60 },
     { re: /^\/api\/site\/address\/[A-Za-z0-9]{14,90}$/, maxAge: 20 },
@@ -54,6 +55,9 @@ const server = http.createServer((req, res) => {
         res.writeHead(204, {
             'Access-Control-Allow-Origin': ALLOW_ORIGIN,
             'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            // Read-only data, no credentials: allow the usual request headers
+            // (Accept, Content-Type, Cache-Control...) so preflights never fail.
+            'Access-Control-Allow-Headers': 'Accept, Accept-Language, Content-Type, Cache-Control, Pragma, X-Requested-With',
             'Access-Control-Max-Age': '86400',
         });
         return res.end();

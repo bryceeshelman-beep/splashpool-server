@@ -2,7 +2,7 @@
 """Connect to the pool as a miner, take the first mining.notify, rebuild the
 coinbase and decode it with bitcoin-cli. Compare with /api/splash/payouts, and
 check the payout rules independently: Splash Bonus = min(1.125 BTC, reward) to
-the finder, fee = floor((reward - bonus) * 0.125%), and the /Splashpool/ tag.
+the finder, fee = floor((reward - bonus) * 0.125%), and the -=+SplashPool+=- tag.
 Use a miner address that is not the fee address (they would merge).
 usage: check-coinbase.py <miner address> [--port 3333] [--api http://127.0.0.1:3334]
                          [--datadir ~/.bitcoin] [--quiet]"""
@@ -14,7 +14,7 @@ ap.add_argument('--host', default='127.0.0.1')
 ap.add_argument('--port', type=int, default=3333)
 ap.add_argument('--api', default='http://127.0.0.1:3334')
 ap.add_argument('--datadir', default=os.environ.get('BITCOIN_DATADIR', os.path.expanduser('~/.bitcoin')))
-ap.add_argument('--tag', default='/Splashpool/')
+ap.add_argument('--tag', default='-=+SplashPool+=-')
 ap.add_argument('--bonus', type=int, default=112_500_000)
 ap.add_argument('--fee-ppm', type=int, default=1250)
 ap.add_argument('--quiet', action='store_true', help='do not list every output')

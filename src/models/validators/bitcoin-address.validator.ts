@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { validate } from 'bitcoin-address-validation';
 import { registerDecorator, ValidationOptions, ValidatorConstraint, ValidatorConstraintInterface } from 'class-validator';
 
+import { isPayableAddress, networkFromConfig } from '../../splash/payout.service';
 
 @ValidatorConstraint({ name: 'bitcoinAddress', async: false })
 @Injectable()
@@ -13,7 +14,9 @@ export class BitcoinAddressValidator implements ValidatorConstraintInterface {
     ) { }
 
     validate(value: string): boolean {
-        return validate(value, this.configService.get('NETWORK'));
+        const network = this.configService.get('NETWORK');
+        // A good checksum isn't enough: the coinbase must be able to pay it.
+        return validate(value, network) && isPayableAddress(value, networkFromConfig(network));
     }
 
     defaultMessage(): string {
