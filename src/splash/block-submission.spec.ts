@@ -1,4 +1,4 @@
-import { settleBlock, submitBlock } from './block-submission';
+import { chainState, submitBlock } from './block-submission';
 
 const block = { hex: '00', hash: 'ours', height: 100 };
 const rpc = (answers: string[], chain: (string | Error)[] = [new Error('height out of range')]) => ({
@@ -17,12 +17,12 @@ describe('block submission', () => {
         expect((await submitBlock(rpc(['SUCCESS!']), block)).outcome).toBe('accepted');
     });
 
-    it.each(['high-hash', 'bad-cb-amount', 'rejected', 'duplicate-invalid', 'prev-blk-not-found', 'bad-blk-sigops'])(
+    it.each(['high-hash', 'bad-cb-amount', 'rejected', 'duplicate-invalid', 'bad-blk-sigops'])(
         'rejects %s', async (reason) => {
             expect((await submitBlock(rpc([reason]), block)).outcome).toBe('rejected');
         });
 
-    it.each(['duplicate', 'inconclusive', 'duplicate-inconclusive', 'RPC_ERROR: timeout'])(
+    it.each(['duplicate', 'inconclusive', 'duplicate-inconclusive', 'prev-blk-not-found', 'RPC_ERROR: timeout'])(
         '%s is not a find by itself', async (reason) => {
             expect((await submitBlock(rpc([reason], ['someone else']), block)).outcome).toBe('unknown');
         });
@@ -32,24 +32,15 @@ describe('block submission', () => {
             expect((await submitBlock(rpc([reason], ['ours']), block)).outcome).toBe('accepted');
         });
 
-    it('finds a block the node took before the reply was lost', async () => {
-        const r = rpc(['RPC_ERROR: timeout', 'duplicate'], [new Error('down'), 'ours']);
-        expect((await settleBlock(r, block, [0, 0])).outcome).toBe('accepted');
-    });
-
-    it('resubmits until a node that was down takes it', async () => {
-        const r = rpc(['RPC_ERROR: refused', 'RPC_ERROR: refused', 'SUCCESS!']);
-        expect((await settleBlock(r, block, [0, 0, 0, 0])).outcome).toBe('accepted');
-        expect(r.SUBMIT_BLOCK).toHaveBeenCalledTimes(3);
-    });
-
-    it('stops at a rejection', async () => {
-        const r = rpc(['high-hash']);
-        expect((await settleBlock(r, block, [0, 0, 0])).outcome).toBe('rejected');
-        expect(r.SUBMIT_BLOCK).toHaveBeenCalledTimes(1);
-    });
-
-    it('never turns a lost race into a find', async () => {
-        expect((await settleBlock(rpc(['inconclusive'], ['someone else']), block, [0, 0])).outcome).toBe('unknown');
+    it.each([
+        ['ours, 99 deep', 198, 'ours', true, false],
+        ['ours, 100 deep', 199, 'ours', true, true],
+        ['another, 99 deep', 198, 'theirs', false, false],
+        ['another, 100 deep', 199, 'theirs', false, true],
+        ['node cannot say', 199, new Error('down'), null, false],
+        ['tip unknown', null, 'theirs', false, false],
+    ])('%s', async (_, tip, answer, inChain, buried) => {
+        const r = { ...rpc([], [answer as string]), getMiningInfo: jest.fn(async () => (tip == null ? null : { blocks: tip }) as any) };
+        expect(await chainState(r, block)).toEqual({ inChain, buried });
     });
 });

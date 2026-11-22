@@ -24,7 +24,11 @@ import { IMiningInfo } from './bitcoin-rpc/IMiningInfo';
 import { MiningJob } from './MiningJob';
 import { StratumV1Client } from './StratumV1Client';
 import { MiningSubmitMessage } from './stratum-messages/MiningSubmitMessage';
-import * as blockSubmission from '../splash/block-submission';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+import { FoundBlocksService } from '../splash/found-blocks';
 
 
 
@@ -50,6 +54,8 @@ describe('StratumV1Client', () => {
     let clientStatisticsService: ClientStatisticsService;
     let notificationService: NotificationService;
     let blocksService: BlocksService;
+    let foundBlocks: FoundBlocksService;
+    let foundDir: string;
     let externalSharesService;
     let shareWindowService;
     let configService: ConfigService;
@@ -164,7 +170,8 @@ describe('StratumV1Client', () => {
             notifySubscribersBlockFound: jest.fn().mockResolvedValue(undefined)
         } as any;
         blocksService = {
-            save: jest.fn().mockResolvedValue(undefined)
+            save: jest.fn().mockResolvedValue(undefined),
+            saveOnce: jest.fn(async block => { await blocksService.save(block); return true; })
         } as any;
         externalSharesService = {
             submitShare: jest.fn().mockResolvedValue(undefined)
@@ -172,6 +179,10 @@ describe('StratumV1Client', () => {
         shareWindowService = {
             recordShare: jest.fn()
         };
+        // Never the real directory: the pool resubmits whatever is in there.
+        foundDir = mkdtempSync(join(tmpdir(), 'splash-client-'));
+        foundBlocks = new FoundBlocksService(bitcoinRpcService, blocksService, notificationService,
+            { get: key => (key === 'SPLASH_FOUND_BLOCKS_DIR' ? foundDir : 'testnet') } as any);
 
 
         client = new StratumV1Client(
@@ -180,8 +191,7 @@ describe('StratumV1Client', () => {
             bitcoinRpcService,
             clientService,
             clientStatisticsService,
-            notificationService,
-            blocksService,
+            foundBlocks,
             configService,
             addressSettings,
             externalSharesService,
@@ -195,6 +205,8 @@ describe('StratumV1Client', () => {
 
     afterEach(async () => {
         client.destroy();
+        await foundBlocks.stop();
+        rmSync(foundDir, { recursive: true, force: true });
         consoleLogSpy.mockRestore();
         consoleErrorSpy.mockRestore();
         consoleWarnSpy.mockRestore();
@@ -277,8 +289,7 @@ describe('StratumV1Client', () => {
             bitcoinRpcService,
             clientService,
             clientStatisticsService,
-            notificationService,
-            blocksService,
+            foundBlocks,
             configService,
             moduleRef.get<AddressSettingsService>(AddressSettingsService),
             externalSharesService
@@ -582,8 +593,7 @@ describe('StratumV1Client', () => {
             bitcoinRpcService,
             clientService,
             clientStatisticsService,
-            notificationService,
-            blocksService,
+            foundBlocks,
             configService,
             moduleRef.get<AddressSettingsService>(AddressSettingsService),
             externalSharesService
@@ -641,6 +651,72 @@ describe('StratumV1Client', () => {
         expect((client as any).write).lastCalledWith(`{"id":5,"error":null,"result":true}\n`);
     });
 
+    it('still saves, submits and credits a block when the reply to the miner fails', async () => {
+        jest.spyOn(client as any, 'write').mockImplementation((data: string) => data.startsWith('{"id":5,"error":null,"result":true}') ? Promise.resolve(false) : Promise.resolve(true));
+        jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+            submissionDifficulty: Number.MAX_SAFE_INTEGER,
+            submissionHash: 'block-share'
+        });
+        const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+        jest.spyOn(addressSettings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+
+        emitMessage(MockRecording1.MINING_SUBMIT);
+        jest.useRealTimers();
+        await new Promise((r) => setTimeout(r, 1000));
+
+        expect(bitcoinRpcService.SUBMIT_BLOCK).toHaveBeenCalledWith(expect.any(String));
+        expect(blocksService.save).toHaveBeenCalledTimes(1);
+        expect(shareWindowService.recordShare).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not wait for a miner that never reads the reply', async () => {
+        jest.spyOn(client as any, 'write').mockImplementation((data: string) => data.startsWith('{"id":5,"error":null,"result":true}') ? new Promise<boolean>(() => undefined) : Promise.resolve(true));
+        jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+            submissionDifficulty: Number.MAX_SAFE_INTEGER,
+            submissionHash: 'block-share'
+        });
+        const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
+        jest.spyOn(addressSettings, 'resetBestDifficultyAndShares').mockResolvedValue(undefined);
+
+        emitMessage(MockRecording1.MINING_SUBSCRIBE);
+        emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
+        emitMessage(MockRecording1.MINING_AUTHORIZE);
+        await new Promise((r) => setTimeout(r, 100));
+
+        emitMessage(MockRecording1.MINING_SUBMIT);
+        jest.useRealTimers();
+        await new Promise((r) => setTimeout(r, 1000));
+
+        expect(bitcoinRpcService.SUBMIT_BLOCK).toHaveBeenCalledWith(expect.any(String));
+        expect(blocksService.save).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        ['judges submits already received when the miner goes', true, 3, 3],
+        ['judges only 16 of them', true, 40, 16],
+        ['judges none before login', false, 3, 0],
+    ])('%s', async (_, loggedIn, sent, judged) => {
+        jest.useRealTimers();
+        (client as any).stratumInitialized = loggedIn;
+        const handled: string[] = [];
+        jest.spyOn(client as any, 'handleMessage').mockImplementation(async (m: string) => {
+            handled.push(m);
+            if (handled.length === 1) {
+                Object.defineProperty(socket, 'destroyed', { value: true, configurable: true });
+            }
+        });
+        emitMessage(['{"id":1,"method":"first"}', '{"id":2,"method":"mining.configure"}',
+            ...Array(sent).fill('{"id":3,"method":"mining.submit"}')].join('\n'));
+        await new Promise((r) => setTimeout(r, 50));
+        expect(handled).toHaveLength(1 + (judged as number));
+        expect(handled.filter(m => m.includes('configure'))).toHaveLength(0);
+    });
+
     it.each([
         ['high-hash', false],
         ['RPC_ERROR: timeout', false],
@@ -649,7 +725,6 @@ describe('StratumV1Client', () => {
     ])('node answers %s: recorded as found = %s', async (answer, found) => {
         (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mockResolvedValue(answer);
         (bitcoinRpcService.getBlockHash as jest.Mock).mockResolvedValue('someone else');
-        jest.spyOn(blockSubmission, 'settleBlock').mockResolvedValue({ outcome: 'unknown', response: answer as string });
         jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
         jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
             submissionDifficulty: Number.MAX_SAFE_INTEGER,
@@ -673,9 +748,8 @@ describe('StratumV1Client', () => {
     });
 
     it('records a block that is accepted on a retry', async () => {
-        (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mockResolvedValue('RPC_ERROR: timeout');
+        (bitcoinRpcService.SUBMIT_BLOCK as jest.Mock).mockResolvedValueOnce('RPC_ERROR: timeout').mockResolvedValue('SUCCESS!');
         (bitcoinRpcService.getBlockHash as jest.Mock).mockResolvedValue('someone else');
-        jest.spyOn(blockSubmission, 'settleBlock').mockResolvedValue({ outcome: 'accepted', response: 'SUCCESS!' });
         jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
         jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
             submissionDifficulty: Number.MAX_SAFE_INTEGER,
@@ -691,7 +765,7 @@ describe('StratumV1Client', () => {
 
         emitMessage(MockRecording1.MINING_SUBMIT);
         jest.useRealTimers();
-        await new Promise((r) => setTimeout(r, 1000));
+        await new Promise((r) => setTimeout(r, 2700));
 
         expect(blocksService.save).toHaveBeenCalledTimes(1);
         expect(notificationService.notifySubscribersBlockFound).toHaveBeenCalledTimes(1);
@@ -1152,6 +1226,44 @@ describe('StratumV1Client', () => {
             withConfig({ SPLASH_REJECT_LIMIT: '10', SPLASH_REJECT_RATIO: '0.5' });
             note(true, 10);
             expect(note(false, 10)).toBe(true);
+        });
+
+        const reporting = () => {
+            const reporter = { accepted: jest.fn(), junk: jest.fn() };
+            (client as any).ipReporter = reporter;
+            return reporter;
+        };
+
+        it('reports valid shares, and junk only when the connection is closed for it', () => {
+            withConfig({});
+            const reporter = reporting();
+            note(true, 3);
+            expect(reporter.accepted).toHaveBeenCalledTimes(3);
+            note(false, 100);
+            expect(reporter.junk).not.toHaveBeenCalled();
+            note(false, 100);
+            expect(reporter.junk).toHaveBeenCalled();
+        });
+
+        it('a mostly good connection is never reported as junk', () => {
+            withConfig({});
+            const reporter = reporting();
+            note(true, 1000);
+            note(false, 300);
+            expect(reporter.junk).not.toHaveBeenCalled();
+        });
+
+        it('repeated invalid handshake messages make a junk connection', async () => {
+            withConfig({});
+            const reporter = reporting();
+            jest.spyOn(client as any, 'write').mockResolvedValue(true);
+            jest.spyOn(console, 'error').mockImplementation(() => undefined);
+            for (let i = 0; i < 200; i++) {
+                emitMessage(`{"id":4,"method":"mining.suggest_difficulty","params":["junk"]}`);
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+            expect(reporter.junk).toHaveBeenCalled();
+            expect(socket.destroy).toHaveBeenCalled();
         });
 
         it('disconnects a client that floods duplicate shares', async () => {

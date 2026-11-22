@@ -8,12 +8,10 @@ import { firstValueFrom, Subscription, switchMap } from 'rxjs';
 import { clearInterval } from 'timers';
 
 import { AddressSettingsService } from '../ORM/address-settings/address-settings.service';
-import { BlocksService } from '../ORM/blocks/blocks.service';
 import { ClientStatisticsService } from '../ORM/client-statistics/client-statistics.service';
 import { ClientEntity } from '../ORM/client/client.entity';
 import { ClientService } from '../ORM/client/client.service';
 import { BitcoinRpcService } from '../services/bitcoin-rpc.service';
-import { NotificationService } from '../services/notification.service';
 import { IJobTemplate, StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { eRequestMethod } from './enums/eRequestMethod';
 import { eResponseMethod } from './enums/eResponseMethod';
@@ -29,7 +27,9 @@ import { SuggestDifficulty } from './stratum-messages/SuggestDifficultyMessage';
 import { StratumV1ClientStatistics } from './StratumV1ClientStatistics';
 import { ExternalSharesService } from '../services/external-shares.service';
 import { ShareWindowService } from '../ORM/share-window/share-window.service';
-import { settleBlock, submitBlock } from '../splash/block-submission';
+import { ISubmitResult } from '../splash/block-submission';
+import { FoundBlocksService } from '../splash/found-blocks';
+import { IConnectionReporter } from '../splash/ip-guard';
 import { PayoutService } from '../splash/payout.service';
 
 const TRUE_DIFF_ONE = 2.695953529101131e67;
@@ -39,6 +39,8 @@ const MAX_FUTURE_BLOCK_SECONDS = 2 * 60 * 60;
 // Stratum messages are under 1 KB.
 const MAX_LINE_LENGTH = 16 * 1024;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
+// More than a miner sends in one packet, and too few to be worth flooding.
+const MAX_SUBMITS_AFTER_CLOSE = 16;
 const VALIDATION_ERROR_LOG_INTERVAL_MS = 60 * 1000;
 
 export class StratumV1Client {
@@ -80,6 +82,7 @@ export class StratumV1Client {
     // judged and credited only by that, never by the current session difficulty.
     private issuedJobs = new Map<string, number>();
     private pendingInputBytes = 0;
+    private submitsAfterClose = 0;
 
     constructor(
         public readonly socket: Socket,
@@ -87,13 +90,13 @@ export class StratumV1Client {
         private readonly bitcoinRpcService: BitcoinRpcService,
         private readonly clientService: ClientService,
         private readonly clientStatisticsService: ClientStatisticsService,
-        private readonly notificationService: NotificationService,
-        private readonly blocksService: BlocksService,
+        private readonly foundBlocks: FoundBlocksService,
         private readonly configService: ConfigService,
         private readonly addressSettingsService: AddressSettingsService,
         private readonly externalSharesService: ExternalSharesService,
         private readonly shareWindowService?: ShareWindowService,
-        private readonly payoutService?: PayoutService
+        private readonly payoutService?: PayoutService,
+        private readonly ipReporter?: IConnectionReporter
     ) {
 
         this.socket.on('data', (data: Buffer) => {
@@ -114,8 +117,19 @@ export class StratumV1Client {
 
             (async () => {
                 for (const m of lines.filter(l => l.length > 0)) {
-                    if (this.connectionClosed || this.socket.destroyed || this.socket.writableEnded) {
+                    if (this.connectionClosed) {
                         break;
+                    }
+                    if (this.socket.destroyed || this.socket.writableEnded) {
+                        // Already received, and one could be a block: still judge the
+                        // submits of a miner that logged in, up to a small limit.
+                        if (!this.stratumInitialized || this.submitsAfterClose >= MAX_SUBMITS_AFTER_CLOSE) {
+                            break;
+                        }
+                        if (!m.includes(eRequestMethod.SUBMIT)) {
+                            continue;
+                        }
+                        this.submitsAfterClose++;
                     }
                     try {
                         await this.handleMessage(m);
@@ -212,6 +226,7 @@ export class StratumV1Client {
                     if (!success) {
                         return;
                     }
+                    this.noteShareResult(false); // Repeated, this is a junk connection.
                 }
 
                 break;
@@ -250,6 +265,7 @@ export class StratumV1Client {
                     if (!success) {
                         return;
                     }
+                    this.noteShareResult(false); // Repeated, this is a junk connection.
                 }
 
                 break;
@@ -291,6 +307,7 @@ export class StratumV1Client {
                     if (!success) {
                         return;
                     }
+                    this.noteShareResult(false); // Repeated, this is a junk connection.
                 }
 
                 break;
@@ -342,6 +359,7 @@ export class StratumV1Client {
                     if (!success) {
                         return;
                     }
+                    this.noteShareResult(false); // Repeated, this is a junk connection.
                 }
                 break;
             }
@@ -690,16 +708,17 @@ export class StratumV1Client {
         // (possible on test networks, where blocks can be easier than the floor).
         if (submissionDifficulty >= shareDifficulty) {
             this.noteShareResult(true);
-            const success = await this.write(JSON.stringify(submission.response()) + '\n');
-            if (!success) {
-                return false;
-            }
+            // Taken now: both can change while this awaits.
+            const { address, worker } = this.clientAuthorization;
+            const credit = () => this.shareWindowService?.recordShare(address, shareDifficulty, Date.now(), worker);
 
-            // Splash Pool: credit this share to the 3-day window before any
-            // block handling, so a block-finding share counts too.
-            this.shareWindowService?.recordShare(this.clientAuthorization.address, shareDifficulty, Date.now(), this.clientAuthorization.worker);
-
+            // A block is saved and submitted before the reply, which fails if the
+            // miner has gone or the pool is stopping. It must not depend on either.
+            let submitting: Promise<ISubmitResult> = null;
             if (submissionDifficulty >= jobTemplate.blockData.networkDifficulty) {
+                // Splash Pool: credit this share to the 3-day window before any
+                // block handling, so a block-finding share counts too.
+                credit();
                 console.log('!!! BLOCK FOUND !!!');
                 const updatedJobBlock = job.copyAndUpdateBlock(
                     jobTemplate,
@@ -709,37 +728,27 @@ export class StratumV1Client {
                     extraNonce2,
                     timestamp
                 );
-                const blockHex = updatedJobBlock.toHex(false);
+                const hex = updatedJobBlock.toHex(false);
                 const height = jobTemplate.blockData.height;
-                const block = { hex: blockHex, hash: updatedJobBlock.getId(), height };
-                // Logged before submitting: a block that isn't accepted is only kept here.
-                console.log(`Submitting block ${block.hash} at height ${height}: ${blockHex}`);
-                const { address, worker } = this.clientAuthorization;
-                const sessionId = this.extraNonceAndSessionId;
-                const recordFound = async (response: string) => {
-                    await this.blocksService.save({ height, minerAddress: address, worker, sessionId, blockData: blockHex });
-                    await this.notificationService.notifySubscribersBlockFound(address, height, updatedJobBlock, response);
-                };
+                const hash = updatedJobBlock.getId();
+                submitting = this.foundBlocks.found({
+                    hex, hash, height, address, worker, sessionId: this.extraNonceAndSessionId, foundAt: Date.now(),
+                });
+                // A spare copy if the disk fails. The journal can drop or cut it.
+                console.log(`Submitting block ${hash} at height ${height}: ${hex}`);
+            }
 
-                const { outcome, response: result } = await submitBlock(this.bitcoinRpcService, block);
-                if (outcome === 'accepted') {
-                    await recordFound(result);
-                } else {
-                    console.error(`Block ${block.hash} not recorded as found (${outcome}): ${result}`);
-                }
-                if (outcome === 'unknown') {
-                    // In the background, so the miner isn't held up and may disconnect.
-                    void settleBlock(this.bitcoinRpcService, block)
-                        .then(async settled => {
-                            console.log(`Block ${block.hash} settled as ${settled.outcome}: ${settled.response}`);
-                            if (settled.outcome === 'accepted') {
-                                await recordFound(settled.response);
-                            }
-                        })
-                        .catch(e => console.error(`Block ${block.hash}: follow-up failed`, e));
-                }
+            const success = await this.write(JSON.stringify(submission.response()) + '\n');
+            if (!success) {
+                return false;
+            }
+
+            if (submitting == null) {
+                credit();
+            } else {
+                const { outcome, response } = await submitting;
                 //success
-                if (outcome === 'accepted' && result == null) {
+                if (outcome === 'accepted' && response == null) {
                     await this.addressSettingsService.resetBestDifficultyAndShares();
                 }
             }
@@ -992,6 +1001,7 @@ export class StratumV1Client {
         }
         if (accepted) {
             this.rejectWindowAccepted++;
+            this.ipReporter?.accepted();
             return false;
         }
         this.rejectWindowRejected++;
@@ -1012,6 +1022,7 @@ export class StratumV1Client {
         } else {
             log.suppressed++;
         }
+        this.ipReporter?.junk();
         this.closeSocket();
         return true;
     }

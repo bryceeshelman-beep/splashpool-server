@@ -58,7 +58,8 @@ export class AddressSettingsService {
     }
 
     public async createNew(address: string) {
-        return await this.addressSettingsRepository.save({ address });
+        // No transaction: see ShareWindowService.flushLocked.
+        return await this.addressSettingsRepository.save({ address }, { transaction: false });
     }
 
     public async addShares(address: string, shares: number) {

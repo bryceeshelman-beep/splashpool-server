@@ -19,9 +19,10 @@ export class TelegramSubscriptionsService {
     }
 
     public async saveSubscription(chatId: number, address: string) {
+        // No transaction: see ShareWindowService.flushLocked.
         return await this.telegramSubscriptions.save({
             telegramChatId: chatId,
             address
-        });
+        }, { transaction: false });
     }
 }

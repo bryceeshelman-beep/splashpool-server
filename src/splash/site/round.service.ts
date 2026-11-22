@@ -6,13 +6,15 @@ import { IsNull, Repository } from 'typeorm';
 import { BlocksEntity } from '../../ORM/blocks/blocks.entity';
 import { ShareWindowService } from '../../ORM/share-window/share-window.service';
 import { BitcoinRpcService } from '../../services/bitcoin-rpc.service';
+import { chainState, headerHash } from '../block-submission';
 import { SplashRoundEntity } from './round.entity';
 
 /**
  * Tracks the pool's work since its last accepted block (the website's tank).
  * Share work comes from ShareWindowService (counted on the share path, taken
  * here every 10 s). A new row in blocks_entity whose hash is in the active
- * chain closes the round; a rejected submission does not.
+ * chain closes the round. One is passed over only once another block is
+ * buried at its height; until then it is checked again.
  */
 @Injectable()
 export class RoundService implements OnModuleInit, OnApplicationShutdown {
@@ -82,12 +84,18 @@ export class RoundService implements OnModuleInit, OnApplicationShutdown {
             .orderBy('b.id', 'ASC')
             .getMany();
         let current = open;
+        let waiting = false;
         for (const b of fresh) {
-            const inChain = await this.isInActiveChain(b.blockData, b.height);
+            const { inChain, buried } = await chainState(
+                this.bitcoinRpcService, { hash: headerHash(b.blockData), height: b.height });
             if (!inChain) {
-                // Remember it so a rejected block is checked only once.
-                await this.rounds.update({ id: current.id }, { blockId: b.id });
-                current.blockId = b.id;
+                if (inChain === false && buried && !waiting) {
+                    await this.rounds.update({ id: current.id }, { blockId: b.id });
+                    current.blockId = b.id;
+                } else {
+                    // Not settled: don't move the mark past it.
+                    waiting = true;
+                }
                 continue;
             }
             const endedAt = b.createdAt ? new Date(b.createdAt).getTime() : Date.now();
@@ -95,21 +103,6 @@ export class RoundService implements OnModuleInit, OnApplicationShutdown {
             await this.rounds.insert({ startedAt: endedAt, endedAt: null, work: 0, blockId: b.id, height: null });
             current = await this.rounds.findOne({ where: { endedAt: IsNull() } });
             console.log(`Splash tank: SPLASH at height ${b.height}, round closed with ${open.work} work`);
-        }
-    }
-
-    private async isInActiveChain(blockHex: string, height: number): Promise<boolean> {
-        try {
-            // Header hash = double SHA256 of the first 80 bytes, byte-reversed.
-            const header = Buffer.from(blockHex.slice(0, 160), 'hex');
-            const crypto = await import('crypto');
-            const h1 = crypto.createHash('sha256').update(header).digest();
-            const hash = Buffer.from(crypto.createHash('sha256').update(h1).digest()).reverse().toString('hex');
-            const chainHash = await this.bitcoinRpcService.getBlockHash(height);
-            return chainHash === hash;
-        } catch (e) {
-            console.error('Splash tank: block check failed', e?.message ?? e);
-            return false;
         }
     }
 

@@ -34,6 +34,8 @@ interface IPendingBucket {
     shares: number;
 }
 
+const FLUSH_CHUNK_SIZE = 200;
+
 /**
  * Splash Pool share window (time-based PPLNS).
  *
@@ -118,22 +120,27 @@ export class ShareWindowService implements OnApplicationShutdown {
         }
         const batch = Array.from(this.pending.values());
         this.pending = new Map();
+        let written = 0;
         try {
-            await this.repository.manager.transaction(async manager => {
-                for (const b of batch) {
-                    await manager.query(
-                        `INSERT INTO share_bucket_entity (address, bucket, difficulty, shares)
-                         VALUES (?, ?, ?, ?)
-                         ON CONFLICT(address, bucket) DO UPDATE SET
-                           difficulty = difficulty + excluded.difficulty,
-                           shares = shares + excluded.shares`,
-                        [b.address, b.bucket, b.difficulty, b.shares]
-                    );
-                }
-            });
+            // No transaction: the process has one SQLite connection, so any other
+            // write would collide with it or land inside it. Each statement is
+            // atomic by itself, so each chunk is stored wholly or not at all.
+            while (written < batch.length) {
+                const chunk = batch.slice(written, written + FLUSH_CHUNK_SIZE);
+                await this.repository.query(
+                    `INSERT INTO share_bucket_entity (address, bucket, difficulty, shares)
+                     VALUES ${chunk.map(() => '(?, ?, ?, ?)').join(', ')}
+                     ON CONFLICT(address, bucket) DO UPDATE SET
+                       difficulty = difficulty + excluded.difficulty,
+                       shares = shares + excluded.shares`,
+                    chunk.flatMap(b => [b.address, b.bucket, b.difficulty, b.shares])
+                );
+                written += chunk.length;
+            }
         } catch (e) {
-            // Put the batch back so no work is lost; the next flush retries it.
-            for (const b of batch) {
+            // Put back only what wasn't stored, so nothing is lost or counted
+            // twice; the next flush retries it.
+            for (const b of batch.slice(written)) {
                 const key = `${b.address}|${b.bucket}`;
                 const entry = this.pending.get(key);
                 if (entry) {

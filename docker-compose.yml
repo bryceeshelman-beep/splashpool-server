@@ -7,6 +7,8 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Must stay longer than the save on shutdown (15 s); Docker's default is 10 s.
+    stop_grace_period: 30s
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -17,4 +19,6 @@ services:
       - "./.env:/public-pool/.env:ro"
     environment:
       - NODE_ENV=production
+      # In the DB volume, so found blocks outlive the container.
+      - SPLASH_FOUND_BLOCKS_DIR=/public-pool/DB/found-blocks
 

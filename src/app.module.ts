@@ -28,6 +28,7 @@ import { ExternalSharesService } from './services/external-shares.service';
 import { ExternalShareController } from './controllers/external-share/external-share.controller';
 import { ExternalSharesModule } from './ORM/external-shares/external-shares.module';
 import { ShareWindowModule } from './ORM/share-window/share-window.module';
+import { FoundBlocksService } from './splash/found-blocks';
 import { SplashModule } from './splash/splash.module';
 import { SplashController } from './controllers/splash/splash.controller';
 import { SiteModule } from './splash/site/site.module';
@@ -88,6 +89,7 @@ const ORMModules = [
         ExternalSharesService,
         RoundService,
         SiteService,
+        FoundBlocksService,
     ],
 })
 export class AppModule {

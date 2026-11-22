@@ -130,7 +130,7 @@ describe('ShareWindowService', () => {
 
     it('keeps the work when a flush fails and writes it on the next one', async () => {
         const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-        const spy = jest.spyOn(repo.manager, 'transaction').mockRejectedValueOnce(new Error('disk full'));
+        const spy = jest.spyOn(repo, 'query').mockRejectedValueOnce(new Error('disk full'));
         service.recordShare('A', 42, NOW);
         await service.flush();
         expect(await repo.count()).toBe(0);
@@ -139,6 +139,29 @@ describe('ShareWindowService', () => {
         await service.flush();
         expect((await repo.find())[0].difficulty).toBe(42);
         expect((await service.getWindow(NOW)).totalDifficulty).toBe(42);
+        errorSpy.mockRestore();
+    });
+
+    it('retries only the part of a flush that was not stored', async () => {
+        const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        for (let i = 0; i < 500; i++) {
+            service.recordShare(`M${i}`, 10, NOW);
+        }
+        const real = repo.query.bind(repo);
+        let call = 0;
+        const spy = jest.spyOn(repo, 'query').mockImplementation(async (...args: [string, any[]?]) => {
+            if (++call === 2) {
+                throw new Error('disk full');
+            }
+            return real(...args);
+        });
+        await service.flush();
+        spy.mockRestore();
+        expect(await repo.count()).toBe(200);
+        expect((await service.getWindow(NOW)).totalDifficulty).toBe(5000);
+        await service.flush();
+        expect(await repo.count()).toBe(500);
+        expect((await service.getWindow(NOW)).totalDifficulty).toBe(5000);
         errorSpy.mockRestore();
     });
 });

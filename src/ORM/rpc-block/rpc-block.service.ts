@@ -19,7 +19,8 @@ export class RpcBlockService {
     }
 
     public lockBlock(blockHeight: number, process: string) {
-        return this.rpcBlockRepository.save({ blockHeight, data: null, lockedBy: process });
+        // No transaction: see ShareWindowService.flushLocked.
+        return this.rpcBlockRepository.save({ blockHeight, data: null, lockedBy: process }, { transaction: false });
     }
 
     public saveBlock(blockHeight: number, data: string) {

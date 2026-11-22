@@ -37,6 +37,8 @@ services:
       - "./public-pool-mainnet.env:/public-pool/.env:ro"
     environment:
       - NODE_ENV=production
+      # In the DB volume, so found blocks outlive the container.
+      - SPLASH_FOUND_BLOCKS_DIR=/public-pool/DB/found-blocks
 
 networks:
   bitcoin:

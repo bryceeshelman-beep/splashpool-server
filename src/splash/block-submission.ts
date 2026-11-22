@@ -1,3 +1,5 @@
+import { createHash } from 'crypto';
+
 import { BitcoinRpcService } from '../services/bitcoin-rpc.service';
 
 type Rpc = Pick<BitcoinRpcService, 'SUBMIT_BLOCK' | 'getBlockHash'>;
@@ -14,11 +16,34 @@ export interface ISubmitResult {
 }
 
 // Answers that don't settle it: the RPC failed (the node may still have taken
-// the block), or the node has the block and it isn't on the best chain (yet).
-const UNSETTLED = ['duplicate', 'inconclusive', 'duplicate-inconclusive'];
+// the block), the node has the block and it isn't on the best chain (yet), or
+// the node is still catching up and hasn't got the parent.
+const UNSETTLED = ['duplicate', 'inconclusive', 'duplicate-inconclusive', 'prev-blk-not-found'];
 
-// Quickly at first, then every 30 s for two hours.
-export const RETRY_DELAYS_MS = [2_000, 5_000, 10_000, ...Array<number>(240).fill(30_000)];
+export const CONFIRMATIONS = 100;
+
+/** Block hash = double SHA256 of the 80-byte header, byte-reversed. */
+export function headerHash(blockHex: string): string {
+    const sha = (b: Buffer) => createHash('sha256').update(b).digest();
+    return sha(sha(Buffer.from(blockHex.slice(0, 160), 'hex'))).reverse().toString('hex');
+}
+
+/**
+ * Where a block stands. `inChain` is null when the node can't say, which is not
+ * a no. Only `buried` makes a no final: reorgs and node restarts undo the rest.
+ */
+export async function chainState(
+    rpc: Pick<BitcoinRpcService, 'getBlockHash' | 'getMiningInfo'>,
+    block: Pick<IFoundBlock, 'hash' | 'height'>,
+): Promise<{ inChain: boolean | null, buried: boolean }> {
+    try {
+        const tip = (await rpc.getMiningInfo())?.blocks;
+        const inChain = (await rpc.getBlockHash(block.height)) === block.hash;
+        return { inChain, buried: tip != null && tip - block.height + 1 >= CONFIRMATIONS };
+    } catch {
+        return { inChain: null, buried: false };
+    }
+}
 
 /** Submit once. A block is ours only if the node took it or has it in its chain. */
 export async function submitBlock(rpc: Rpc, block: IFoundBlock): Promise<ISubmitResult> {
@@ -35,17 +60,4 @@ export async function submitBlock(rpc: Rpc, block: IFoundBlock): Promise<ISubmit
     }
     const unsettled = UNSETTLED.includes(response) || response.startsWith('RPC_ERROR');
     return { outcome: unsettled ? 'unknown' : 'rejected', response };
-}
-
-/** Resubmit an unsettled block until the node accepts or rejects it, or time runs out. */
-export async function settleBlock(rpc: Rpc, block: IFoundBlock, delays = RETRY_DELAYS_MS): Promise<ISubmitResult> {
-    let last: ISubmitResult = { outcome: 'unknown', response: 'not retried' };
-    for (const ms of delays) {
-        await new Promise(resolve => setTimeout(resolve, ms));
-        last = await submitBlock(rpc, block);
-        if (last.outcome !== 'unknown') {
-            break;
-        }
-    }
-    return last;
 }

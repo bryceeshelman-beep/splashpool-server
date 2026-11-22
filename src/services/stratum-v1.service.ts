@@ -6,13 +6,13 @@ import { Server, Socket } from 'net';
 import { monitorEventLoopDelay } from 'perf_hooks';
 
 import { StratumV1Client } from '../models/StratumV1Client';
+import { FoundBlocksService } from '../splash/found-blocks';
+import { IpGuard, ipGuardOptions } from '../splash/ip-guard';
 import { AddressSettingsService } from '../ORM/address-settings/address-settings.service';
-import { BlocksService } from '../ORM/blocks/blocks.service';
 import { ClientStatisticsService } from '../ORM/client-statistics/client-statistics.service';
 import { ClientService } from '../ORM/client/client.service';
 import { BitcoinRpcService } from './bitcoin-rpc.service';
 import { ExternalSharesService } from './external-shares.service';
-import { NotificationService } from './notification.service';
 import { StratumV1JobsService } from './stratum-v1-jobs.service';
 
 interface StratumListenerState {
@@ -37,13 +37,16 @@ export class StratumV1Service implements OnModuleInit {
     private readonly eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
     private backpressureMonitor: NodeJS.Timeout | null = null;
     private healthyBackpressureChecks = 0;
+    // One for the life of the process: a paused and resumed listener keeps its bans.
+    private ipGuard: IpGuard | null = null;
+    private readonly sockets = new Set<Socket>();
+    private stopping = false;
 
     constructor(
         private readonly bitcoinRpcService: BitcoinRpcService,
         private readonly clientService: ClientService,
         private readonly clientStatisticsService: ClientStatisticsService,
-        private readonly notificationService: NotificationService,
-        private readonly blocksService: BlocksService,
+        private readonly foundBlocks: FoundBlocksService,
         private readonly configService: ConfigService,
         private readonly stratumV1JobsService: StratumV1JobsService,
         private readonly addressSettingsService: AddressSettingsService,
@@ -87,7 +90,30 @@ export class StratumV1Service implements OnModuleInit {
     }
 
     private createSocketServer(): Server {
+        if (this.ipGuard == null) {
+            this.ipGuard = new IpGuard(ipGuardOptions(key => this.configService.get(key)));
+            console.log(this.ipGuard.describe());
+        }
+        const guard = this.ipGuard;
         const server = new Server(async (socket: Socket) => {
+            if (this.stopping) {
+                socket.destroy();
+                return;
+            }
+            // Read now: a socket forgets its address once it's closed.
+            const ip = socket.remoteAddress;
+            const reporter = guard.open(ip, socket);
+            if (reporter == null) {
+                // Before any client exists, so refusing costs almost nothing.
+                socket.on('error', () => undefined);
+                socket.destroy();
+                return;
+            }
+            this.sockets.add(socket);
+            socket.on('close', () => {
+                this.sockets.delete(socket);
+                guard.close(ip, socket);
+            });
 
             //5 min
             socket.setTimeout(1000 * 60 * 5);
@@ -98,18 +124,20 @@ export class StratumV1Service implements OnModuleInit {
                 this.bitcoinRpcService,
                 this.clientService,
                 this.clientStatisticsService,
-                this.notificationService,
-                this.blocksService,
+                this.foundBlocks,
                 this.configService,
                 this.addressSettingsService,
                 this.externalSharesService,
                 this.shareWindowService,
-                this.payoutService
+                this.payoutService,
+                reporter
             );
 
 
             socket.on('close', async (hadError: boolean) => {
-                if (client.extraNonceAndSessionId != null) {
+                // When stopping, skip it: these writes would hold up saving the
+                // shares, and startup clears the client table anyway.
+                if (!this.stopping && client.extraNonceAndSessionId != null) {
                     // Handle socket disconnection
                     await client.destroy();
                     console.log(`Client ${client.extraNonceAndSessionId} disconnected, hadError?:${hadError}`);
@@ -137,8 +165,18 @@ export class StratumV1Service implements OnModuleInit {
         return server;
     }
 
+    /** For shutdown: no new connections and no more shares. */
+    public stopIntake() {
+        this.stopping = true;
+        if (this.backpressureMonitor != null) {
+            clearInterval(this.backpressureMonitor);
+        }
+        this.listeners.forEach(listener => listener.server?.close());
+        this.sockets.forEach(socket => socket.destroy());
+    }
+
     private listen(listener: StratumListenerState) {
-        if (listener.server != null) {
+        if (this.stopping || listener.server != null) {
             return;
         }
 

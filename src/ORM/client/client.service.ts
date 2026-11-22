@@ -6,6 +6,9 @@ import { ObjectLiteral, Repository } from 'typeorm';
 
 import { ClientEntity } from './client.entity';
 
+// TypeORM reads inserted rows back with one OR per row, and SQLite refuses an
+// expression more than 1000 deep: 996 clients in one insert fail.
+const INSERT_CHUNK_SIZE = 250;
 
 
 @Injectable()
@@ -31,16 +34,20 @@ export class ClientService {
             return;
         }
 
-        try {
-            const results = await this.clientRepository.insert(queueCopy.map(c => c.partialClient));
+        for (let start = 0; start < queueCopy.length; start += INSERT_CHUNK_SIZE) {
+            const chunk = queueCopy.slice(start, start + INSERT_CHUNK_SIZE);
+            try {
+                const results = await this.clientRepository.insert(chunk.map(c => c.partialClient));
 
-            queueCopy.forEach((c, index) => {
-                c.result.next(results.generatedMaps[index]);
-                c.result.complete();
-            });
-        } catch (e) {
-            queueCopy.forEach(c => c.result.error(e));
-            throw e;
+                chunk.forEach((c, index) => {
+                    c.result.next(results.generatedMaps[index]);
+                    c.result.complete();
+                });
+            } catch (e) {
+                // Only this chunk's clients fail. The others are still saved.
+                console.error(`Saving ${chunk.length} new clients failed`, e);
+                chunk.forEach(c => c.result.error(e));
+            }
         }
     }
 

@@ -7,6 +7,12 @@ import { readFileSync } from 'fs';
 import * as ecc from 'tiny-secp256k1';
 
 import { AppModule } from './app.module';
+import { validatorContainer } from './models/validators/validator-container';
+import { ShareWindowService } from './ORM/share-window/share-window.service';
+import { StratumV1Service } from './services/stratum-v1.service';
+import { FoundBlocksService } from './splash/found-blocks';
+import { shutdownHandler } from './splash/shutdown';
+import { RoundService } from './splash/site/round.service';
 
 async function bootstrap() {
 
@@ -38,18 +44,21 @@ async function bootstrap() {
     }),
   );
 
-  process.on('SIGINT', () => {
-    console.log(`Stopping services`);
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', () => {
-    console.log(`Stopping services`);
-    process.exit(0);
-  });
+  const stop = shutdownHandler(
+    () => app.get(StratumV1Service, { strict: false }).stopIntake(),
+    [
+      () => app.get(FoundBlocksService, { strict: false }).stop(),
+      () => app.get(ShareWindowService, { strict: false }).onApplicationShutdown(),
+      () => app.get(RoundService, { strict: false }).onApplicationShutdown(),
+      // Again: a share received before the stop can turn out to be a block during the saves.
+      () => app.get(FoundBlocksService, { strict: false }).stop(),
+    ],
+  );
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
 
   app.enableCors();
-  useContainer(app.select(AppModule), { fallbackOnErrors: true });
+  useContainer(validatorContainer(app.select(AppModule)), { fallback: true, fallbackOnErrors: true });
 
   //Taproot
   bitcoinjs.initEccLib(ecc);
