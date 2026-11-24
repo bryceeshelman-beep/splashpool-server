@@ -100,6 +100,10 @@ All dates are UTC.
   reason (`bad-json`, `oversize`, `unknown-method`, `auth-timeout`, `rejects`,
   `bad-submit`, `blocked-agent`, `idle`, `pool-stopping`, `error`,
   `client-closed`). Miner-supplied text is limited to printable ASCII.
+- `SPLASH_MAX_DIFFICULTY` (default 2^53): a miner's share difficulty is capped,
+  whether it comes from `suggest_difficulty`, `d=` or vardiff. Credit was
+  already capped at the network difficulty, so this only stops huge values
+  like `1e308` being sent to firmware.
 
 ## API
 
@@ -142,8 +146,9 @@ All dates are UTC.
   real pool on a throwaway regtest node and checks each accepted coinbase
   against an independent implementation of the payout rules: a normal split,
   the minimum-payout drop, a reward smaller than the Splash Bonus, a tiny
-  shared part, a single miner, a block found in a miner's first second, and
-  shares arriving at the moment of the block. `TESTING.md` lists what we want
+  shared part, a single miner, a block found in a miner's first second,
+  shares arriving at the moment of the block, and a block with real
+  transaction fees. `TESTING.md` lists what we want
   testers to try.
 
 Many tests were added alongside these changes (`*.spec.ts` under `src/`).

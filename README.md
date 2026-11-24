@@ -30,9 +30,24 @@ Example: 3.125 BTC subsidy + 0.02 BTC fees = 314,500,000 sats
 | Split by work | 201,747,500 |
 
 Averaged over many blocks, each miner earns its share of the pool hashrate times
-(reward − fee). The bonus changes the shape of payouts, not the average. Slices
-under 10,000 sats aren't paid. Their portion goes to the block's paid miners.
+(reward − fee). The bonus changes the shape of payouts, not the average.
 Full rules: [docs/SPLASH-PAYOUTS.md](docs/SPLASH-PAYOUTS.md).
+
+### Small miners: read this
+
+- **Slices under 10,000 sats aren't paid** (`SPLASH_MIN_PAYOUT_SATS`). Their
+  portion goes to the block's paid miners.
+- **There is no balance.** An unpaid slice isn't saved or carried over. Your
+  shares do stay in the 3-day window, so they count again for every block the
+  pool finds in that time, and a block found while you're mining can still pay
+  you the full Splash Bonus.
+- **A coinbase only has room for so many payouts.** All outputs must fit in
+  5,000 bytes (some miner firmware crashes on bigger coinbases): about 159 split
+  payouts to `bc1q…` addresses, about 114 to `bc1p…` (taproot), and never more
+  than 250. When more miners qualify, the smallest slices are dropped first.
+- Rough guide: with a 3.145 BTC block, a slice reaches 10,000 sats at about
+  1/20,000 of the pool's work over 3 days. If the pool runs 1 PH/s, that's about
+  50 GH/s of steady mining.
 
 ## Testnet instance
 
@@ -107,6 +122,20 @@ python3 scripts/audit-blocks.py
 npm test          # unit tests
 npm run test:e2e  # end-to-end
 ```
+
+## Tested miners
+
+Confirmed to mine and get shares accepted, with the coinbase sizes this pool
+builds:
+
+| Miner | Firmware | Reports as | Where |
+|---|---|---|---|
+| Hammer | 3.0.5 | `THOR` | Mainnet since 2026-11-20 (needed the BIP310 version-rolling fix in [CHANGES.md](CHANGES.md)) |
+| Bitaxe (602) | OSM 2.15.4 | `bitaxe` | Mainnet since 2026-11-20 |
+| Bitaxe Hex | AxeOS 2.11.1 | `bitaxe` | Testnet, 2026-11-19 |
+
+Your miner isn't listed? Try it on the testnet and tell us how it went: see
+[TESTING.md](TESTING.md).
 
 ## Thanks to our testers
 
