@@ -9,11 +9,15 @@ Starts its own throwaway bitcoind -regtest (RPC 28543, ZMQ 28545) and pool
 (stratum 23435, API 23436); touches nothing else. Needs bitcoind/bitcoin-cli
 (BITCOIN_BIN dir, or on PATH) and node.
 
-Cases:
+Cases (A-D share one window; E-H start on a fresh one):
   A  normal reward, three miners 3:2:1, the smallest one finds the block
   B  minimum payout raised so the smallest miner is dropped and redistributed
   C  block reward smaller than the Splash Bonus (after regtest halvings)
   D  reward just above the bonus: tiny shared part, 6-sat fee, split to finder
+  E  a brand-new miner's very first submission is a block, on an empty window
+  F  only one miner has shares: it is the finder and the whole shared part
+  G  a newcomer joins a pool with shares and finds a block in its first second
+  H  shares land at the same moment the block is found (burst around the submit)
 """
 import calendar, hashlib, json, os, shutil, socket, struct, subprocess, sys, time, urllib.request, secrets
 
@@ -109,6 +113,15 @@ class Miner:
             if (int.from_bytes(dsha(h), 'little') <= target) == block:
                 return en2, t, '%08x' % k, dsha(h)[::-1].hex()
 
+    def submit_nowait(self, job, en2, t, nonce):
+        self.i += 1
+        self.send('mining.submit', [self.addr + '.w', job[0], en2, t, nonce], self.i)
+        return self.i
+
+    def result(self, i, t=10):
+        m = self.wait(lambda m: m.get('id') == i, t)
+        return 'closed' if not m else 'ok' if m.get('result') else m['error'][1]
+
     def submit(self, job, en2, t, nonce):
         self.i += 1
         self.send('mining.submit', [self.addr + '.w', job[0], en2, t, nonce], self.i)
@@ -199,15 +212,20 @@ def wait_snapshot(after, miners):
         time.sleep(1)
     return False
 
-def mine_case(name, finder, miners, fee_addr, bonus, min_payout, burn):
-    """Make a new template so jobs use the current snapshot, mine a block as `finder`, check its coinbase."""
-    window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
-    cli('generatetoaddress', '1', burn)  # new block -> fresh jobs from the current snapshot
-    job = finder.job_on(cli('getbestblockhash'))
+def mine_case(name, finder, miners, fee_addr, bonus, min_payout, burn, job=None, window=None, burst=None):
+    """Mine a block as `finder` and check its coinbase. Without `job`, first makes a
+    new template so the job uses the current snapshot (and `window` is read now).
+    `burst(submit_block)` may wrap the block submission with other traffic."""
+    if window is None:
+        window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
+    if job is None:
+        cli('generatetoaddress', '1', burn)  # new block -> fresh jobs from the current snapshot
+        job = finder.job_on(cli('getbestblockhash'))
     assert job, 'no job on the new tip'
     en2, t, nonce, h = finder.solve(job, True)
     before = int(cli('getblockcount'))
-    res = finder.submit(job, en2, t, nonce)
+    submit_block = lambda: finder.submit(job, en2, t, nonce)
+    res = burst(submit_block) if burst else submit_block()
     for _ in range(40):
         if int(cli('getblockcount')) > before:
             break
@@ -247,8 +265,8 @@ try:
                              '-printtoconsole=0', '-fallbackfee=0.0001'])
     cli('-rpcwait', 'getblockcount')
     js = ("const b=require('bitcoinjs-lib');const n=b.networks.regtest;"
-          "console.log(JSON.stringify([1,2,3,4,5].map(j=>b.payments.p2wpkh({hash:b.crypto.sha256(Buffer.from('payout'+j)).subarray(0,20),network:n}).address)))")
-    fee_addr, alice, bob, carol, burn = json.loads(subprocess.check_output(['node', '-e', js], cwd=POOL_SRC))
+          "console.log(JSON.stringify([1,2,3,4,5,6,7].map(j=>b.payments.p2wpkh({hash:b.crypto.sha256(Buffer.from('payout'+j)).subarray(0,20),network:n}).address)))")
+    fee_addr, alice, bob, carol, burn, erin, frank = json.loads(subprocess.check_output(['node', '-e', js], cwd=POOL_SRC))
     cli('generatetoaddress', '20', burn)  # past the BIP34 1-byte heights; reward 50 BTC
 
     write_env(fee_addr)
@@ -310,6 +328,77 @@ try:
     got, parts, reward = mine_case('D tiny shared part', A, [A, B, C], fee_addr, subsidy - 5_000, 10_000, burn)
     ok('D: 6-sat fee from the 5,000-sat shared part', got.get(fee_addr) == 6, f"fee={got.get(fee_addr)}")
     ok('D: split under the minimum goes to the finder', got == {fee_addr: 6, alice: reward - 6})
+
+    # E-H run on a fresh share window (new pool DB), reward 0.78125 BTC, bonus 0.1 BTC.
+    E_BONUS = 10_000_000
+    stop_pool()
+    os.rename(f'{WORK}/pool/DB', f'{WORK}/pool/DB-cases-A-D'); os.makedirs(f'{WORK}/pool/DB')
+    write_env(fee_addr, bonus=E_BONUS); start_pool()
+    ok('E setup: share window is empty', api('/api/splash/window')['miners'] == [])
+
+    # E: a brand-new miner's very first submission is a block, on an empty window
+    t0 = time.time()
+    Er = Miner(erin)
+    job = Er.latest_job(15)
+    got, parts, reward = mine_case('E first share is a block, empty window', Er, [Er], fee_addr, E_BONUS, 10_000, burn,
+                                   job=job, window={})
+    took = time.time() - t0
+    ok('E: block found within its first second of connecting', took < 1.0, f'{took:.2f} s')
+    fee_e = (reward - E_BONUS) * 1250 // 1_000_000
+    ok('E: finder gets bonus + the whole split (nobody else has work)', got == {fee_addr: fee_e, erin: reward - fee_e})
+
+    # F: only one miner has shares: it is the finder AND the whole shared part
+    job = Er.latest_job()
+    for _ in range(3):
+        assert Er.submit(job, *Er.solve(job, False)[:3]) == 'ok'
+    ok('F setup: window has only that miner', wait_snapshot(time.time(), 1))
+    got, parts, reward = mine_case('F only one miner', Er, [Er], fee_addr, E_BONUS, 10_000, burn)
+    fee_f = (reward - E_BONUS) * 1250 // 1_000_000
+    ok('F: exactly two outputs, fee and that miner', got == {fee_addr: fee_f, erin: reward - fee_f})
+    ok('F: fee still only on the shared part', fee_f == (reward - E_BONUS) * 1250 // 1_000_000 and fee_f > 0, f'fee={fee_f}')
+
+    # G: a new miner joins a pool that has shares and finds a block in its first second
+    wait_snapshot(time.time(), 1)
+    t0 = time.time()
+    Fr = Miner(frank)
+    job = Fr.latest_job(15)
+    window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
+    got, parts, reward = mine_case('G newcomer finds a block at once', Fr, [Er, Fr], fee_addr, E_BONUS, 10_000, burn,
+                                   job=job, window=window)
+    took = time.time() - t0
+    ok('G: block found within its first second of connecting', took < 1.0, f'{took:.2f} s')
+    ok('G: newcomer gets the bonus (plus rounding) but no split', E_BONUS <= got[frank] <= E_BONUS + 2)
+    ok('G: the miner with shares gets the whole split', got[erin] == parts['pool'] - (got[frank] - E_BONUS))
+
+    # H: shares land at the same moment the block is found
+    for m in (Er, Fr):
+        job = m.latest_job()
+        for _ in range(2):
+            assert m.submit(job, *m.solve(job, False)[:3]) == 'ok'
+    ok('H setup: both miners in the snapshot', wait_snapshot(time.time(), 2))
+    before_w = {w['address']: w for w in api('/api/splash/window')['miners']}
+    cli('generatetoaddress', '1', burn)
+    tip = cli('getbestblockhash')
+    jf, je = Fr.job_on(tip), Er.job_on(tip)
+    burst_ids = []
+    def burst(submit_block):
+        # Frank's shares go out right before AND right after Erin's block, unanswered.
+        for _ in range(10):
+            burst_ids.append(Fr.submit_nowait(jf, *Fr.solve(jf, False)[:3]))
+        r = submit_block()
+        for _ in range(10):
+            burst_ids.append(Fr.submit_nowait(jf, *Fr.solve(jf, False)[:3]))
+        return r
+    got, parts, reward = mine_case('H shares at the moment of the block', Er, [Er, Fr], fee_addr, E_BONUS, 10_000, burn,
+                                   job=je, window={a: w['difficulty'] for a, w in before_w.items()}, burst=burst)
+    results = [Fr.result(i) for i in burst_ids]
+    accepted = results.count('ok')
+    ok('H: every burst share got an answer (accepted or stale)', all(r in ('ok', 'Job not found') for r in results),
+       f'{accepted} ok, {len(results) - accepted} stale')
+    time.sleep(2)
+    after_w = {w['address']: w for w in api('/api/splash/window')['miners']}
+    gained = after_w[frank]['shares'] - before_w[frank]['shares']
+    ok('H: accepted burst shares are credited to the window (for the next block)', gained == accepted, f'gained {gained}')
 
     ok('pool still running', pool.poll() is None)
 finally:
