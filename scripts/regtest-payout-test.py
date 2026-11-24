@@ -18,6 +18,7 @@ Cases (A-D share one window; E-H start on a fresh one):
   F  only one miner has shares: it is the finder and the whole shared part
   G  a newcomer joins a pool with shares and finds a block in its first second
   H  shares land at the same moment the block is found (burst around the submit)
+  I  a block with real transaction fees: fee and split use subsidy + fees
 """
 import calendar, hashlib, json, os, shutil, socket, struct, subprocess, sys, time, urllib.request, secrets
 
@@ -75,11 +76,14 @@ class Miner:
             *ls, self.b = self.b.split(b'\n')
             self.q += [json.loads(l) for l in ls if l]
 
-    def job_on(self, tip, t=20):
-        """Wait for a job built on block `tip` (older queued jobs are skipped)."""
+    def job_on(self, tip, t=20, with_txs=False):
+        """Wait for a job built on block `tip` (older queued jobs are skipped).
+        with_txs: only a job whose block includes transactions (non-empty merkle branch)."""
         want = bytes.fromhex(tip)[::-1]
         def on_tip(m):
             if m.get('method') != 'mining.notify':
+                return False
+            if with_txs and not m['params'][4]:
                 return False
             p = bytes.fromhex(m['params'][1])
             return b''.join(p[i:i + 4][::-1] for i in range(0, 32, 4)) == want
@@ -399,6 +403,32 @@ try:
     after_w = {w['address']: w for w in api('/api/splash/window')['miners']}
     gained = after_w[frank]['shares'] - before_w[frank]['shares']
     ok('H: accepted burst shares are credited to the window (for the next block)', gained == accepted, f'gained {gained}')
+
+    # I: a block with real transaction fees (every block above had none)
+    cli('-named', 'createwallet', 'wallet_name=w')
+    waddr = cli('getnewaddress')
+    cli('generatetoaddress', '101', waddr)  # one wallet coinbase matures
+    ok('I setup: still in the 0.78125 BTC subsidy era', int(cli('getblockcount')) < 1049, cli('getblockcount'))
+    ok('I setup: snapshot settled', wait_snapshot(time.time(), 2))
+    window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
+    N_TX = 12
+    txids = {cli('-named', 'sendtoaddress', f'address={burn}', 'amount=0.01', 'fee_rate=500') for _ in range(N_TX)}
+    pool_fees = round(float(json.loads(cli('getmempoolinfo'))['total_fee']) * 1e8)
+    ok('I setup: transactions in the mempool', len(txids) == N_TX and pool_fees > 0, f'{N_TX} tx, {pool_fees} sats of fees')
+    job = Er.job_on(cli('getbestblockhash'), t=90, with_txs=True)  # the pool refreshes its template every 60 s
+    ok('I setup: pool sent a job that includes the transactions', job is not None)
+    got, parts, reward = mine_case('I block with transaction fees', Er, [Er, Fr], fee_addr, E_BONUS, 10_000, burn,
+                                   job=job, window=window)
+    blk = json.loads(cli('getblock', cli('getbestblockhash'), '1'))
+    stats = json.loads(cli('getblockstats', str(blk['height']), '["subsidy","totalfee"]'))
+    ok('I: block contains all the transactions', txids <= set(blk['tx']), f'{len(blk["tx"]) - 1} tx')
+    ok('I: reward is subsidy + the mempool fees', stats['totalfee'] == pool_fees and reward == stats['subsidy'] + pool_fees,
+       f'{stats["subsidy"]} + {stats["totalfee"]}')
+    fee_i = (reward - E_BONUS) * 1250 // 1_000_000
+    ok('I: pool fee is taken on (subsidy + tx fees - bonus)', got[fee_addr] == fee_i
+       and fee_i > (stats['subsidy'] - E_BONUS) * 1250 // 1_000_000, f'fee={fee_i}')
+    ok('I: miners get exactly bonus + the split of (reward - bonus - fee)',
+       got[erin] + got[frank] == E_BONUS + parts['pool'] == reward - fee_i and got[erin] > E_BONUS and got[frank] > 0)
 
     ok('pool still running', pool.poll() is None)
 finally:
