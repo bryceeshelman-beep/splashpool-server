@@ -39,8 +39,7 @@ Full rules: [docs/SPLASH-PAYOUTS.md](docs/SPLASH-PAYOUTS.md).
   portion goes to the block's paid miners.
 - **There is no balance.** An unpaid slice isn't saved or carried over. Your
   shares do stay in the 3-day window, so they count again for every block the
-  pool finds in that time, and a block found while you're mining can still pay
-  you the full Splash Bonus.
+  pool finds in that time.
 - **A coinbase only has room for so many payouts.** All outputs must fit in
   5,000 bytes (some miner firmware crashes on bigger coinbases): about 159 split
   payouts to `bc1q…` addresses, about 114 to `bc1p…` (taproot), and never more
@@ -48,6 +47,8 @@ Full rules: [docs/SPLASH-PAYOUTS.md](docs/SPLASH-PAYOUTS.md).
 - Rough guide: with a 3.145 BTC block, a slice reaches 10,000 sats at about
   1/20,000 of the pool's work over 3 days. If the pool runs 1 PH/s, that's about
   50 GH/s of steady mining.
+- **The Splash Bonus has no minimum.** No matter how small your miner is, if it
+  finds a block, you get the full 1.125 BTC Splash Bonus, with no fee taken.
 
 ## Testnet instance
 
