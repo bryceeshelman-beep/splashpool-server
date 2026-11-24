@@ -42,6 +42,11 @@ const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 // More than a miner sends in one packet, and too few to be worth flooding.
 const MAX_SUBMITS_AFTER_CLOSE = 16;
 const VALIDATION_ERROR_LOG_INTERVAL_MS = 60 * 1000;
+// Unknown or unusable messages in a row, with no accepted share between them,
+// before a connection is closed as junk.
+const MAX_INVALID_MESSAGES = 10;
+// Sent by real firmware and safe to ignore: these never count toward that limit.
+const HARMLESS_METHODS = new Set(['mining.extranonce.subscribe', 'mining.multi_version', 'mining.ping']);
 
 export class StratumV1Client {
     private static blockedUserAgentLogState = new Map<string, { nextLogAt: number, suppressed: number }>();
@@ -84,6 +89,15 @@ export class StratumV1Client {
     private pendingInputBytes = 0;
     private submitsAfterClose = 0;
 
+    // Splash Pool connection hygiene (see closeAsJunk and connectionSummary).
+    private readonly connectedAt = Date.now();
+    private closeReason: string = null;
+    private invalidSinceAccepted = 0;
+    private invalidTotal = 0;
+    private acceptedTotal = 0;
+    private rejectedTotal = 0;
+    private authTimer: NodeJS.Timeout = null;
+
     constructor(
         public readonly socket: Socket,
         private readonly stratumV1JobsService: StratumV1JobsService,
@@ -99,6 +113,20 @@ export class StratumV1Client {
         private readonly ipReporter?: IConnectionReporter
     ) {
 
+        // A connection must subscribe and authorize within this many seconds,
+        // or it is closed as junk. 0 (the default) turns it off.
+        const authTimeoutSeconds = this.configNumber('SPLASH_AUTH_TIMEOUT_SECONDS', 0);
+        if (authTimeoutSeconds > 0) {
+            this.authTimer = setTimeout(() => {
+                this.authTimer = null;
+                if (!this.stratumInitialized && !this.connectionClosed) {
+                    this.closeAsJunk('auth-timeout');
+                }
+            }, authTimeoutSeconds * 1000);
+            this.authTimer.unref?.();
+            this.socket.once('close', () => this.clearAuthTimer());
+        }
+
         this.socket.on('data', (data: Buffer) => {
             if (this.connectionClosed) {
                 return;
@@ -111,7 +139,8 @@ export class StratumV1Client {
                 || this.buffer.length > MAX_LINE_LENGTH
                 || lines.some(l => l.length > MAX_LINE_LENGTH)) {
                 this.buffer = '';
-                this.closeSocket();
+                this.invalidTotal++;
+                this.closeAsJunk('oversize');
                 return;
             }
 
@@ -146,6 +175,7 @@ export class StratumV1Client {
     }
 
     public async destroy() {
+        this.clearAuthTimer();
 
         if (this.extraNonceAndSessionId) {
             await this.clientService.delete(this.extraNonceAndSessionId);
@@ -174,8 +204,12 @@ export class StratumV1Client {
         try {
             parsedMessage = JSON.parse(message);
         } catch (e) {
-            //console.log("Invalid JSON");
-            await this.socket.end();
+            parsedMessage = null;
+        }
+        if (parsedMessage == null || typeof parsedMessage !== 'object' || Array.isArray(parsedMessage)) {
+            // Not a Stratum message at all: no miner sends this.
+            this.invalidTotal++;
+            this.closeAsJunk('bad-json');
             return;
         }
 
@@ -198,6 +232,7 @@ export class StratumV1Client {
                 if (errors.length === 0) {
                     if (this.isBlockedUserAgent(subscriptionMessage.userAgent)) {
                         this.logBlockedUserAgent(subscriptionMessage.userAgent);
+                        this.setCloseReason('blocked-agent');
                         this.closeSocket();
                         return;
                     }
@@ -405,17 +440,29 @@ export class StratumV1Client {
                     if (!success) {
                         return;
                     }
+                    this.setCloseReason('bad-submit');
                     this.closeSocket();
                     return;
                 }
                 break;
             }
-            // default: {
-            //     console.log("Invalid message");
-            //     console.log(parsedMessage);
-            //     await this.socket.end();
-            //     return;
-            // }
+            default: {
+                // Ignored, as upstream does. Known-harmless methods and replies
+                // (an id with result or error and no method, e.g. answers to
+                // client.get_version or client.show_message) never count. Ten
+                // other unknown messages in a row with no accepted share in
+                // between is a junk connection.
+                if (StratumV1Client.isHarmlessMessage(parsedMessage)) {
+                    break;
+                }
+                this.invalidTotal++;
+                this.invalidSinceAccepted++;
+                if (this.invalidSinceAccepted >= MAX_INVALID_MESSAGES) {
+                    this.closeAsJunk('unknown-method');
+                    return;
+                }
+                break;
+            }
         }
 
 
@@ -433,6 +480,7 @@ export class StratumV1Client {
 
         if (this.isBlockedUserAgent(this.clientSubscription.userAgent)) {
             this.logBlockedUserAgent(this.clientSubscription.userAgent);
+            this.setCloseReason('blocked-agent');
             this.closeSocket();
             return;
         }
@@ -1001,10 +1049,13 @@ export class StratumV1Client {
         }
         if (accepted) {
             this.rejectWindowAccepted++;
+            this.acceptedTotal++;
+            this.invalidSinceAccepted = 0;
             this.ipReporter?.accepted();
             return false;
         }
         this.rejectWindowRejected++;
+        this.rejectedTotal++;
         const limit = this.configNumber('SPLASH_REJECT_LIMIT', 200);
         if (limit <= 0 || this.rejectWindowRejected < limit) {
             return false;
@@ -1022,9 +1073,52 @@ export class StratumV1Client {
         } else {
             log.suppressed++;
         }
+        this.closeAsJunk('rejects');
+        return true;
+    }
+
+    /** A message real firmware sends that is safe to ignore. */
+    private static isHarmlessMessage(message: any): boolean {
+        if (typeof message.method === 'string') {
+            return HARMLESS_METHODS.has(message.method);
+        }
+        return message.method == null && 'id' in message && ('result' in message || 'error' in message);
+    }
+
+    /** Closes a connection that is junk and tells the IP guard. */
+    private closeAsJunk(reason: string) {
+        this.setCloseReason(reason);
         this.ipReporter?.junk();
         this.closeSocket();
-        return true;
+    }
+
+    /** Why this connection closed. The first reason given wins. */
+    public setCloseReason(reason: string) {
+        if (this.closeReason == null) {
+            this.closeReason = reason;
+        }
+    }
+
+    private clearAuthTimer() {
+        if (this.authTimer != null) {
+            clearTimeout(this.authTimer);
+            this.authTimer = null;
+        }
+    }
+
+    /**
+     * One line describing this connection, for the SPLASH_CONN_LOG close log.
+     * Miner-supplied text (worker, user agent) is cut short and stripped of
+     * anything but printable ASCII, so it can't forge or break log lines.
+     */
+    public connectionSummary(ip: string, hadError: boolean): string {
+        const clean = (s: unknown, max: number) => s == null ? '-' : (String(s).replace(/[^\x21-\x7e]/g, '?').slice(0, max) || '-');
+        const reason = this.closeReason ?? (hadError ? 'error' : 'client-closed');
+        const auth = this.clientAuthorization;
+        const worker = auth == null ? '-' : `${clean(auth.address, 100)}${auth.worker ? '.' + clean(auth.worker, 40) : ''}`;
+        const seconds = Math.round((Date.now() - this.connectedAt) / 1000);
+        return `Splash conn: ip=${clean(ip?.replace(/^::ffff:/i, ''), 45)} worker=${worker} agent=${clean(this.clientSubscription?.userAgent, 40)}`
+            + ` reason=${reason} dur=${seconds}s acc=${this.acceptedTotal} rej=${this.rejectedTotal} invalid=${this.invalidTotal}`;
     }
 
     private configNumber(key: string, fallback: number): number {

@@ -95,6 +95,8 @@ export class StratumV1Service implements OnModuleInit {
             console.log(this.ipGuard.describe());
         }
         const guard = this.ipGuard;
+        // One line per closed connection (who, why, how long, shares). Off by default.
+        const connLog = String(this.configService.get('SPLASH_CONN_LOG') ?? '').trim().toLowerCase() === 'true';
         const server = new Server(async (socket: Socket) => {
             if (this.stopping) {
                 socket.destroy();
@@ -135,6 +137,12 @@ export class StratumV1Service implements OnModuleInit {
 
 
             socket.on('close', async (hadError: boolean) => {
+                if (connLog) {
+                    if (this.stopping) {
+                        client.setCloseReason('pool-stopping');
+                    }
+                    console.log(client.connectionSummary(ip, hadError));
+                }
                 // When stopping, skip it: these writes would hold up saving the
                 // shares, and startup clears the client table anyway.
                 if (!this.stopping && client.extraNonceAndSessionId != null) {
@@ -145,6 +153,7 @@ export class StratumV1Service implements OnModuleInit {
             });
 
             socket.on('timeout', () => {
+                client.setCloseReason('idle');
                 console.log('socket timeout');
                 socket.end();
                 socket.destroy();
