@@ -99,6 +99,12 @@ npm test          # unit tests
 npm run test:e2e  # end-to-end
 ```
 
+## Thanks to our testers
+
+Everyone who finds a bug, breaks something, or tests new firmware gets listed here.
+
+Be the first: see [TESTING.md](TESTING.md).
+
 ## License
 
 GPL-3.0, the same as upstream public-pool. See [LICENSE.txt](LICENSE.txt).
