@@ -1,5 +1,13 @@
 # Try to break Splashpool
 
+## How to connect
+
+- Pool: `stratum+tcp://testnet.splashpool.us:3335`
+- Username: a **testnet4** `tb1…` address, optionally followed by `.workername`
+- Password: anything
+
+Test coins only: nothing here has value, and the pool may be reset.
+
 ## Connection and difficulty (try these live on testnet):
 
 - Set difficulty to 0, a negative number, or something huge

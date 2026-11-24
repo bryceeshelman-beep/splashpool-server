@@ -36,9 +36,18 @@ Full rules: [docs/SPLASH-PAYOUTS.md](docs/SPLASH-PAYOUTS.md).
 
 ## Testnet instance
 
-A public **testnet** Splashpool instance will be available, so you can point a
-miner at it and watch the payouts work without risking real coins. Its address
-will be posted here.
+A public **testnet4** Splashpool instance is live, so you can point a miner at it
+without risking real coins:
+
+```
+stratum+tcp://testnet.splashpool.us:3335
+username: your testnet4 tb1… address (optionally .workername)
+password: anything
+```
+
+It's for testing: coins have no value, the pool may be reset, and abuse limits
+are strict (temporary bans are expected). See [TESTING.md](TESTING.md) for what
+to try.
 
 ## Setup
 
