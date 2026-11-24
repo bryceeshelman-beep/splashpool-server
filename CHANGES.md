@@ -88,6 +88,19 @@ All dates are UTC.
   SQLite runs with `synchronous=NORMAL` plus a WAL checkpoint every 10 s.
 - Credited shares are saved when the pool stops (SIGTERM, 15 s limit).
 
+**2026-11-24**
+- Bad JSON (or a non-object message) and oversized lines close the connection
+  and count as junk for the per-IP guard. Upstream closed them silently.
+- Unknown methods: ten in a row with no accepted share between them close the
+  connection as junk. Known-harmless methods (`mining.extranonce.subscribe`,
+  `mining.multi_version`, `mining.ping`) and replies never count.
+- `SPLASH_AUTH_TIMEOUT_SECONDS` (default off): close connections that don't
+  subscribe and authorize in time.
+- `SPLASH_CONN_LOG` (default off): one log line per closed connection with the
+  reason (`bad-json`, `oversize`, `unknown-method`, `auth-timeout`, `rejects`,
+  `bad-submit`, `blocked-agent`, `idle`, `pool-stopping`, `error`,
+  `client-closed`). Miner-supplied text is limited to printable ASCII.
+
 ## API
 
 **2026-11-20**
@@ -124,5 +137,13 @@ All dates are UTC.
   upstream's registry credentials. `package.json` license set to `GPL-3.0` to
   match `LICENSE.txt` (upstream had the npm default `UNLICENSED`). Added
   `.gitleaksignore` for three known false positives in upstream's history.
+
+- **2026-11-24**: `scripts/regtest-payout-test.py` mines real blocks through a
+  real pool on a throwaway regtest node and checks each accepted coinbase
+  against an independent implementation of the payout rules: a normal split,
+  the minimum-payout drop, a reward smaller than the Splash Bonus, a tiny
+  shared part, a single miner, a block found in a miner's first second, and
+  shares arriving at the moment of the block. `TESTING.md` lists what we want
+  testers to try.
 
 Many tests were added alongside these changes (`*.spec.ts` under `src/`).
