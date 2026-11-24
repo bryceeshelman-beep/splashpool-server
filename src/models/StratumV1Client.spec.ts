@@ -789,6 +789,7 @@ describe('StratumV1Client', () => {
                 return null;
             });
             (client as any).minDifficultyCache = undefined;
+            (client as any).maxDifficultyCache = undefined;
         };
 
         it('raises a too-low suggest_difficulty to the floor', async () => {
@@ -817,6 +818,40 @@ describe('StratumV1Client', () => {
             expect((client as any).minDifficulty).toBe(512);
             withConfig({ NETWORK: 'mainnet', SPLASH_MIN_DIFFICULTY: '0' });
             expect((client as any).minDifficulty).toBe(0);
+        });
+
+        it.each([[1e30], [1e308], [2 ** 60]])('caps a huge suggest_difficulty (%p) at 2^53 by default', async (huge) => {
+            withConfig({ SPLASH_MIN_DIFFICULTY: '512' });
+            jest.spyOn(socket, 'write').mockImplementation((data) => true);
+            emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [${huge}]}`);
+            await new Promise((r) => setTimeout(r, 1));
+            expect((client as any).sessionDifficulty).toBe(2 ** 53);
+            expect(socket.write).toHaveBeenCalledWith(`{"id":null,"method":"mining.set_difficulty","params":[${2 ** 53}]}\n`, expect.any(Function));
+        });
+
+        it('SPLASH_MAX_DIFFICULTY sets the cap; invalid values fall back to 2^53; the floor wins a conflict', () => {
+            withConfig({ SPLASH_MAX_DIFFICULTY: '1e12' });
+            expect((client as any).clampDifficulty(5e12)).toBe(1e12);
+            expect((client as any).clampDifficulty(4096)).toBe(4096);
+            for (const bad of ['abc', '0', '-5', 'Infinity']) {
+                withConfig({ SPLASH_MAX_DIFFICULTY: bad });
+                expect((client as any).maxDifficulty).toBe(2 ** 53);
+            }
+            withConfig({ SPLASH_MIN_DIFFICULTY: '512', SPLASH_MAX_DIFFICULTY: '100' });
+            expect((client as any).clampDifficulty(1e9)).toBe(512);
+            expect((client as any).clampDifficulty(1)).toBe(512);
+        });
+
+        it('caps vardiff too', async () => {
+            withConfig({ SPLASH_MAX_DIFFICULTY: '1e6' });
+            jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+            jest.spyOn(socket, 'write').mockImplementation((data) => true);
+            emitMessage(MockRecording1.MINING_SUBSCRIBE);
+            emitMessage(MockRecording1.MINING_AUTHORIZE);
+            await new Promise((r) => setTimeout(r, 100));
+            jest.spyOn((client as any).statistics, 'getSuggestedDifficulty').mockReturnValue(5e9);
+            await (client as any).checkDifficulty();
+            expect((client as any).sessionDifficulty).toBe(1e6);
         });
 
         it('does not let vardiff decay below the floor', async () => {

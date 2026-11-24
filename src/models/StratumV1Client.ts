@@ -64,6 +64,7 @@ export class StratumV1Client {
     private usedSuggestedDifficulty = false;
     private sessionDifficulty: number = 100000;
     private minDifficultyCache: number;
+    private maxDifficultyCache: number;
     // Splash Pool reject limit: per-connection counts for the current minute.
     private rejectWindowStart = 0;
     private rejectWindowAccepted = 0;
@@ -879,11 +880,35 @@ export class StratumV1Client {
         return this.minDifficultyCache;
     }
 
+    /**
+     * Splash Pool: highest share difficulty a connection is given. A higher
+     * suggestion can't earn extra credit (credit is capped at the network
+     * difficulty), but numbers like 1e308 confuse some firmware and dashboards.
+     * SPLASH_MAX_DIFFICULTY sets it; the default 2^53 is the largest whole number
+     * sent exactly, about 60x mainnet difficulty in 2026.
+     */
+    private get maxDifficulty(): number {
+        if (this.maxDifficultyCache == null) {
+            const raw = this.configService.get('SPLASH_MAX_DIFFICULTY');
+            const parsed = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                this.maxDifficultyCache = parsed;
+            } else {
+                if (raw != null && `${raw}`.trim() !== '') {
+                    console.warn(`Ignoring invalid SPLASH_MAX_DIFFICULTY=${raw}`);
+                }
+                this.maxDifficultyCache = 2 ** 53;
+            }
+        }
+        return this.maxDifficultyCache;
+    }
+
     private clampDifficulty(difficulty: number): number {
         if (!Number.isFinite(difficulty)) {
             return Math.max(100000, this.minDifficulty);
         }
-        return Math.max(difficulty, this.minDifficulty);
+        // The floor wins if the two are misconfigured the wrong way round.
+        return Math.max(Math.min(difficulty, this.maxDifficulty), this.minDifficulty);
     }
 
     private async checkDifficulty() {
