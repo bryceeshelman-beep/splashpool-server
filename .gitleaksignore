@@ -1,0 +1,10 @@
+# Known false positives, all in upstream public-pool commits from 2023 (by its
+# author, before this fork). They can't be removed without rewriting upstream's
+# history, and they are already public in the upstream repository.
+#  - secrets/key.pem: upstream's self-signed test key (CN=127.0.0.1). Removed
+#    from this repo's tree. Bring your own certificate for API_SECURE=true.
+#  - MiningJob.ts: a string of zeros used as a fake coinbase input.
+#  - README.md: the NestJS template's CircleCI badge placeholder (token=abc1...).
+a7b73b0610c71feb1ad1d4a19c3249c522565cc0:secrets/key.pem:private-key:1
+2b9a4f3d8596b19f30b104b666f28a62b467331b:src/models/MiningJob.ts:coinbase-access-token:112
+4ce2a5951966a46c13829e16945bbff300334aaa:README.md:generic-api-key:5

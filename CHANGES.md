@@ -117,5 +117,12 @@ All dates are UTC.
   `docs/PUBLIC-POOL-README.md`. `.env.example` is rewritten with every setting
   documented. `.gitignore` covers local data. In `full-setup/*.env` the example
   ZMQ host now reads `your-node-ip`.
+- **2026-11-24**: Removed upstream's bundled self-signed test certificate and
+  key (`secrets/cert.pem`, `secrets/key.pem`). The key has been public since
+  2023, so `API_SECURE=true` now needs your own. Removed upstream's GitHub
+  Actions workflows (`.github/workflows/`), which publish Docker images with
+  upstream's registry credentials. `package.json` license set to `GPL-3.0` to
+  match `LICENSE.txt` (upstream had the npm default `UNLICENSED`). Added
+  `.gitleaksignore` for three known false positives in upstream's history.
 
 Many tests were added alongside these changes (`*.spec.ts` under `src/`).
