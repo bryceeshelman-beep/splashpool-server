@@ -1,103 +1,105 @@
-## Description
+# Splashpool
 
-A Nestjs and Typescript Bitcoin stratum mining server.
+A Bitcoin mining pool server that pays miners **inside the block**. There are no
+balances, no payout runs and no accounts: every block the pool finds pays
+everyone straight from its coinbase. It powers [Splash Pool](https://splashpool.us).
 
-## Installation
+Splashpool is a fork of
+[**public-pool**](https://github.com/benjamin-wilson/public-pool) by Benjamin
+Wilson, a NestJS/TypeScript Bitcoin stratum server. Almost all the stratum work
+is his. See [CHANGES.md](CHANGES.md) for what Splashpool changes.
 
-```bash
-$ npm install
-```
+## How the Splash Bonus works
 
-create an new .env file in the root directory and configure it with the parameters in .env.example
+When the pool finds a block, the coinbase pays out like this:
 
-## Running the app
+1. **Splash Bonus**: the miner whose share found the block gets **1.125 BTC**
+   (`SPLASH_BONUS_SATS`). No fee is taken from it.
+2. **Pool fee**: **0.125%** (`SPLASH_FEE_PPM=1250`) of the rest, the *shared
+   reward*. The fee is never taken from the bonus.
+3. **Split**: what's left is shared by work among everyone who mined in the
+   last **3 days** (`SHARE_WINDOW_HOURS=72`), the finder included.
 
-```bash
-# development
-$ npm run start
+Example: 3.125 BTC subsidy + 0.02 BTC fees = 314,500,000 sats
 
-# watch mode
-$ npm run start:dev
+| | sats |
+|---|---|
+| Splash Bonus to the finder | 112,500,000 |
+| Shared reward | 202,000,000 |
+| Fee (0.125% of shared) | 252,500 |
+| Split by work | 201,747,500 |
 
-# production build
-$ npm run build
-```
+Averaged over many blocks, each miner earns its share of the pool hashrate times
+(reward − fee). The bonus changes the shape of payouts, not the average. Slices
+under 10,000 sats aren't paid. Their portion goes to the block's paid miners.
+Full rules: [docs/SPLASH-PAYOUTS.md](docs/SPLASH-PAYOUTS.md).
 
-## Test
+## Testnet instance
 
-```bash
-# unit tests
-$ npm run test
+A public **testnet** Splashpool instance will be available, so you can point a
+miner at it and watch the payouts work without risking real coins. Its address
+will be posted here.
 
-# test coverage
-$ npm run test:cov
-```
+## Setup
 
-## Web interface
-
-See [public-pool-ui](https://github.com/benjamin-wilson/public-pool-ui)
-
-## Deployment
-
-Install pm2 (https://pm2.keymetrics.io/)
-
-```bash
-$ pm2 start dist/main.js
-```
-
-When running the worker app in PM2 cluster mode, start the PM2 daemon with OS-level
-connection scheduling. The environment variable must be present when the PM2 daemon
-starts, not only in the worker configuration.
+You need:
+- A synced **Bitcoin Core** node with RPC enabled (`server=1`) and, ideally,
+  ZMQ block notifications (`zmqpubrawblock=tcp://*:3000`)
+- **Node.js 22.12 or later** (the Docker image uses Node 24)
 
 ```bash
-$ NODE_CLUSTER_SCHED_POLICY=none pm2 start ecosystem.config.js
+git clone https://github.com/<you>/splashpool.git
+cd splashpool
+npm ci
+
+cp .env.example .env
+# Edit .env. At least:
+#   BITCOIN_RPC_URL / BITCOIN_RPC_PORT
+#   BITCOIN_RPC_USER + BITCOIN_RPC_PASSWORD  (or BITCOIN_RPC_COOKIEFILE)
+#   NETWORK              mainnet | testnet | regtest
+#   POOL_IDENTIFIER      your pool's coinbase tag
+#   SPLASH_FEE_ADDRESS   where the pool fee goes (valid for NETWORK)
+#   SPLASH_FEE_PPM, SPLASH_BONUS_SATS  if you want different numbers
+
+npm run build
+npm run start:prod
 ```
 
-Cluster-mode connection dropping requires Node.js `22.12.0` or newer.
+Miners connect to `stratum+tcp://<your-host>:3333` with a Bitcoin address as the
+username (optionally `address.workername`) and any password.
 
-`STRATUM_MAX_CONNECTIONS_PER_LISTENER` is enforced per worker and Stratum port.
-Size it using the busiest port: `worker count * limit`. For example, 28 workers
-with the default limit of `10000` allow up to `280000` connections on one port.
+Every setting is documented in [`.env.example`](.env.example). A few to know:
+- **`SPLASH_PAYOUTS=true`** turns on the coinbase payouts above. Without it the
+  pool behaves like upstream (solo payouts to the finder).
+- The pool **refuses to start** if `SPLASH_FEE_ADDRESS` isn't valid for
+  `NETWORK`, rather than mine blocks that pay a bad script.
+- The API listens on **localhost** only (`API_HOST`). Put a reverse proxy in front
+  of it if you want it public.
+- The per-IP guard starts in **log-only** mode (`SPLASH_IP_MODE=log`). Watch its
+  log lines before switching to `enforce`.
 
-## Docker
+Docker and regtest/testnet setups from upstream still work: see
+[docs/PUBLIC-POOL-README.md](docs/PUBLIC-POOL-README.md) and `full-setup/`.
 
-Build container:
+### Checking a live pool
 
 ```bash
-$ docker build -t public-pool .
+# Connect as a miner, rebuild the coinbase and check it against the rules
+# (needs bitcoin-cli on PATH, or BITCOIN_CLI=/path/to/bitcoin-cli)
+python3 scripts/check-coinbase.py <your-btc-address>
+
+# Audit blocks the pool has found
+python3 scripts/audit-blocks.py
 ```
 
-Run container:
+### Tests
 
 ```bash
-$ docker container run --name public-pool --rm -p 3333:3333 -p 3334:3334 -p 8332:8332 -v .env:/public-pool/.env public-pool
+npm test          # unit tests
+npm run test:e2e  # end-to-end
 ```
 
-### Docker Compose
+## License
 
-Build container:
-```bash
-$ docker compose build
-```
-
-Run container:
-```bash
-$ docker compose up -d
-```
-
-The docker-compose binds to `127.0.0.1` by default. To expose the Stratum services on your server change:
-```diff
-    ports:
--      - "127.0.0.1:3333:3333/tcp"
--      - "127.0.0.1:3334:3334/tcp"
-+      - "3333"
-+      - "3334"
-```
-
-**note**: To successfully connect to the bitcoin RPC you will need to add
-
-```
-rpcallowip=172.16.0.0/12
-```
-
-to your bitcoin.conf.
+GPL-3.0, the same as upstream public-pool. See [LICENSE.txt](LICENSE.txt).
+Splashpool's changes are listed in [CHANGES.md](CHANGES.md).

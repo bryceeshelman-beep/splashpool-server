@@ -44,3 +44,17 @@ settings.json
 **.pem
 /dist-next
 __pycache__/
+
+# Splashpool: local data and config. Never commit these.
+.env.*
+!.env.example
+/DB/
+/data/
+found-blocks/
+*.jsonl
+*.sqlite-wal
+*.sqlite-shm
+*.token
+*.key
+/config/local*.json
+/config/*.local.json
