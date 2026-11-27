@@ -1,0 +1,301 @@
+{
+ "firmwareBuilt": {
+  "setupConnection": {
+   "frame": "00000031000000020002000100000015746573746e65742e73706c617368706f6f6c2e7573090d0662697461786506424d313337300000",
+   "header": {
+    "extensionType": 0,
+    "msgType": 0,
+    "msgLength": 49
+   },
+   "decoded": {
+    "protocol": 0,
+    "minVersion": 2,
+    "maxVersion": 2,
+    "flags": 1,
+    "endpointHost": "testnet.splashpool.us",
+    "endpointPort": 3337,
+    "vendor": "bitaxe",
+    "hardwareVersion": "BM1370",
+    "firmware": "",
+    "deviceId": ""
+   }
+  },
+  "openStandardMiningChannel": {
+   "frame": "000010430000010000001a746231716578616d706c65616464726573732e776f726b657231a5d46853ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "header": {
+    "extensionType": 0,
+    "msgType": 16,
+    "msgLength": 67
+   },
+   "decoded": {
+    "requestId": 1,
+    "userIdentity": "tb1qexampleaddress.worker1",
+    "nominalHashRate": 999999995904,
+    "maxTarget": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+   }
+  },
+  "openExtendedMiningChannel": {
+   "frame": "000013450000010000001a746231716578616d706c65616464726573732e776f726b657231a5d46853ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0600",
+   "header": {
+    "extensionType": 0,
+    "msgType": 19,
+    "msgLength": 69
+   },
+   "decoded": {
+    "requestId": 1,
+    "userIdentity": "tb1qexampleaddress.worker1",
+    "nominalHashRate": 999999995904,
+    "maxTarget": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "minExtranonceSize": 6
+   }
+  },
+  "submitSharesStandard": {
+   "frame": "00801a180000070000002a00000034120000efbeaddeb2a145670000a020",
+   "header": {
+    "extensionType": 32768,
+    "msgType": 26,
+    "msgLength": 24
+   },
+   "decoded": {
+    "channelId": 7,
+    "sequenceNumber": 42,
+    "jobId": 4660,
+    "nonce": 3735928559,
+    "ntime": 1732616626,
+    "version": 547356672
+   }
+  },
+  "submitSharesExtended": {
+   "frame": "00801b210000070000002b00000035120000bebafecab3a145670020a020080102030405060708",
+   "header": {
+    "extensionType": 32768,
+    "msgType": 27,
+    "msgLength": 33
+   },
+   "decoded": {
+    "channelId": 7,
+    "sequenceNumber": 43,
+    "jobId": 4661,
+    "nonce": 3405691582,
+    "ntime": 1732616627,
+    "version": 547364864,
+    "extranonce": "0102030405060708"
+   }
+  }
+ },
+ "firmwareParsed": [
+  {
+   "type": "setupConnectionSuccess",
+   "input": {
+    "usedVersion": 2,
+    "flags": 0
+   },
+   "frame": "000001060000020000000000",
+   "firmware": {
+    "ok": 1,
+    "usedVersion": 2,
+    "flags": 0
+   }
+  },
+  {
+   "type": "openStandardMiningChannelSuccess",
+   "input": {
+    "requestId": 1,
+    "channelId": 5,
+    "target": "000000000000000000000000000000000000000000000000c0ff3f0000000000",
+    "extranoncePrefix": "a1b2c3d40000000000000000",
+    "groupChannelId": 0
+   },
+   "frame": "0000113900000100000005000000000000000000000000000000000000000000000000000000c0ff3f00000000000ca1b2c3d4000000000000000000000000",
+   "firmware": {
+    "ok": 1,
+    "requestId": 1,
+    "channelId": 5,
+    "target": "000000000000000000000000000000000000000000000000c0ff3f0000000000",
+    "extranoncePrefix": "a1b2c3d40000000000000000",
+    "groupChannelId": 0,
+    "pdiff": 1024
+   }
+  },
+  {
+   "type": "openExtendedMiningChannelSuccess",
+   "input": {
+    "requestId": 1,
+    "channelId": 6,
+    "target": "000000000000000000000000000000000000000000000000f0ff0f0000000000",
+    "extranonceSize": 8,
+    "extranoncePrefix": "a1b2c3d4",
+    "groupChannelId": 0
+   },
+   "frame": "0000143300000100000006000000000000000000000000000000000000000000000000000000f0ff0f0000000000080004a1b2c3d400000000",
+   "firmware": {
+    "ok": 1,
+    "requestId": 1,
+    "channelId": 6,
+    "target": "000000000000000000000000000000000000000000000000f0ff0f0000000000",
+    "extranonceSize": 8,
+    "extranoncePrefix": "a1b2c3d4",
+    "groupChannelId": 0
+   }
+  },
+  {
+   "type": "newMiningJob",
+   "input": {
+    "channelId": 5,
+    "jobId": 6699,
+    "minNtime": null,
+    "version": 536870912,
+    "merkleRoot": "1111111111111111111111111111111111111111111111111111111111111111"
+   },
+   "frame": "0080152d0000050000002b1a000000000000201111111111111111111111111111111111111111111111111111111111111111",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "jobId": 6699,
+    "minNtime": null,
+    "_x": 0,
+    "version": 536870912,
+    "merkleRoot": "1111111111111111111111111111111111111111111111111111111111111111"
+   }
+  },
+  {
+   "type": "newMiningJob",
+   "input": {
+    "channelId": 5,
+    "jobId": 6700,
+    "minNtime": 1732616626,
+    "version": 536870912,
+    "merkleRoot": "2222222222222222222222222222222222222222222222222222222222222222"
+   },
+   "frame": "008015310000050000002c1a000001b2a14567000000202222222222222222222222222222222222222222222222222222222222222222",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "jobId": 6700,
+    "minNtime": 1732616626,
+    "version": 536870912,
+    "merkleRoot": "2222222222222222222222222222222222222222222222222222222222222222"
+   }
+  },
+  {
+   "type": "newExtendedMiningJob",
+   "input": {
+    "channelId": 6,
+    "jobId": 7,
+    "minNtime": null,
+    "version": 536870912,
+    "versionRollingAllowed": true,
+    "merklePath": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ],
+    "coinbaseTxPrefix": "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20",
+    "coinbaseTxSuffix": "ffffffff0100f2052a01000000160014333333333333333333333333333333333333333300000000"
+   },
+   "frame": "00801fa50000060000000700000000000000200102aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff202800ffffffff0100f2052a01000000160014333333333333333333333333333333333333333300000000",
+   "firmware": {
+    "ok": 1,
+    "channelId": 6,
+    "jobId": 7,
+    "minNtime": 0,
+    "version": 536870912,
+    "versionRollingAllowed": true,
+    "merklePath": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ],
+    "coinbaseTxPrefix": "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20",
+    "coinbaseTxSuffix": "ffffffff0100f2052a01000000160014333333333333333333333333333333333333333300000000"
+   }
+  },
+  {
+   "type": "newExtendedMiningJob",
+   "input": {
+    "channelId": 6,
+    "jobId": 8,
+    "minNtime": 1732616626,
+    "version": 536870916,
+    "versionRollingAllowed": true,
+    "merklePath": [],
+    "coinbaseTxPrefix": "",
+    "coinbaseTxSuffix": "ff"
+   },
+   "frame": "00801f180000060000000800000001b2a1456704000020010000000100ff",
+   "firmware": {
+    "ok": 1,
+    "channelId": 6,
+    "jobId": 8,
+    "minNtime": 1732616626,
+    "version": 536870916,
+    "versionRollingAllowed": true,
+    "merklePath": [],
+    "coinbaseTxPrefix": "",
+    "coinbaseTxSuffix": "ff"
+   }
+  },
+  {
+   "type": "setNewPrevHash",
+   "input": {
+    "channelId": 5,
+    "jobId": 6699,
+    "prevHash": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "minNtime": 1732616626,
+    "nbits": 486604799
+   },
+   "frame": "008020300000050000002b1a00000f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0fb2a14567ffff001d",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "jobId": 6699,
+    "prevHash": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "minNtime": 1732616626,
+    "nbits": 486604799
+   }
+  },
+  {
+   "type": "setTarget",
+   "input": {
+    "channelId": 5,
+    "maximumTarget": "00000000000000000000000000000000000000000000000080ff7f0000000000"
+   },
+   "frame": "0080212400000500000000000000000000000000000000000000000000000000000080ff7f0000000000",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "maximumTarget": "00000000000000000000000000000000000000000000000080ff7f0000000000",
+    "pdiff": 512
+   }
+  },
+  {
+   "type": "submitSharesSuccess",
+   "input": {
+    "channelId": 5,
+    "lastSequenceNumber": 42,
+    "newSubmitsAcceptedCount": 1,
+    "newSharesSum": "512"
+   },
+   "frame": "00801c140000050000002a000000010000000002000000000000",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "lastSequenceNumber": 42,
+    "newSubmitsAcceptedCount": 1
+   }
+  },
+  {
+   "type": "submitSharesError",
+   "input": {
+    "channelId": 5,
+    "sequenceNumber": 43,
+    "errorCode": "difficulty-too-low"
+   },
+   "frame": "00801d1b0000050000002b00000012646966666963756c74792d746f6f2d6c6f77",
+   "firmware": {
+    "ok": 1,
+    "channelId": 5,
+    "sequenceNumber": 43,
+    "errorCode": "difficulty-too-low"
+   }
+  }
+ ]
+}
