@@ -25,7 +25,7 @@ class FakeSocket extends EventEmitter {
     destroy = jest.fn(() => { this.destroyed = true; return this; });
 }
 
-function makeConnection(options: { maxChannelsPerConnection?: number, budget?: ChannelBudget, ip?: string } = {}) {
+function makeConnection(options: { maxChannelsPerConnection?: number, budget?: ChannelBudget, ip?: string, authTimeoutSeconds?: number, idleAfterSetupSeconds?: number } = {}) {
     const socket = new FakeSocket();
     if (options.ip) socket.remoteAddress = options.ip;
     const conn = new Sv2Connection(socket as any, {} as any, {
@@ -33,7 +33,8 @@ function makeConnection(options: { maxChannelsPerConnection?: number, budget?: C
         certificate: () => Buffer.alloc(74),
         logShares: false,
         connLog: false,
-        authTimeoutSeconds: 0,
+        authTimeoutSeconds: options.authTimeoutSeconds ?? 0,
+        idleAfterSetupSeconds: options.idleAfterSetupSeconds,
         maxChannelsPerConnection: options.maxChannelsPerConnection,
         channelBudget: options.budget,
     });
@@ -293,6 +294,56 @@ describe('Sv2Connection: extensions and channel limits', () => {
             await setup(c.conn);
             await openExtended(c.conn, 1, 'not-an-address.rig');
             expect(budget.count(c.socket.remoteAddress)).toBe(0);
+        });
+    });
+
+    describe('time limits: 30 s to set up, longer once set up (a proxy with no miners yet)', () => {
+        beforeEach(() => jest.useFakeTimers());
+        afterEach(() => jest.useRealTimers());
+
+        it('no SetupConnection within the login deadline: closed as junk at 30 s', async () => {
+            const { conn, socket } = makeConnection({ authTimeoutSeconds: 30 });
+            jest.advanceTimersByTime(30_000);
+            expect(socket.destroyed).toBe(true);
+            expect((conn as any).closeReason).toBe('auth-timeout');
+        });
+
+        it('set up but no channel: kept past 30 s (and 5 min), closed (not as junk) at the longer limit', async () => {
+            const { conn, socket } = makeConnection({ authTimeoutSeconds: 30, idleAfterSetupSeconds: 1800 });
+            await setup(conn);
+            expect(socket.setTimeout).toHaveBeenLastCalledWith(1_800_000);
+            jest.advanceTimersByTime(15 * 60_000);
+            expect(socket.destroyed).toBe(false);
+            jest.advanceTimersByTime(15 * 60_000);
+            expect(socket.destroyed).toBe(true);
+            expect((conn as any).closeReason).toBe('no-channel-timeout');
+        });
+
+        it('default once set up is 30 minutes', async () => {
+            const { conn, socket } = makeConnection({ authTimeoutSeconds: 30 });
+            await setup(conn);
+            expect(socket.setTimeout).toHaveBeenLastCalledWith(30 * 60_000);
+            jest.advanceTimersByTime(29 * 60_000);
+            expect(socket.destroyed).toBe(false);
+        });
+
+        it('a channel opened in time: no close', async () => {
+            const { conn, socket } = makeConnection({ authTimeoutSeconds: 30, idleAfterSetupSeconds: 60 });
+            await setup(conn);
+            await openExtended(conn);
+            jest.advanceTimersByTime(120_000);
+            expect(socket.destroyed).toBe(false);
+        });
+
+        it('a refused SetupConnection keeps the 30 s deadline', async () => {
+            const { conn, socket } = makeConnection({ authTimeoutSeconds: 30 });
+            await feed(conn, enc.setupConnection({
+                protocol: 1, minVersion: 2, maxVersion: 2, flags: 0, endpointHost: 'pool', endpointPort: 3336,
+                vendor: 'x', hardwareVersion: '', firmware: '', deviceId: '',
+            }));
+            jest.advanceTimersByTime(30_000);
+            expect(socket.destroyed).toBe(true);
+            expect(socket.setTimeout).not.toHaveBeenCalled();
         });
     });
 });

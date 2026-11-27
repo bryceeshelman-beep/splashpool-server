@@ -24,6 +24,9 @@ const MAX_INBOUND_PAYLOAD = 4096;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 // Channels on one connection (a proxy puts each miner on its own channel).
 export const DEFAULT_MAX_CHANNELS_PER_CONNECTION = 256;
+// A proxy (SRI translator) opens channels only when its miners connect, so it
+// may sit set up with none for a while; 30 min unless SV2_IDLE_AFTER_SETUP_SECONDS.
+export const DEFAULT_IDLE_AFTER_SETUP_SECONDS = 30 * 60;
 // Extensions this pool supports (sv2-spec extensions/): worker-specific hashrate tracking.
 export const SUPPORTED_EXTENSIONS: readonly number[] = [EXT.WorkerHashrateTracking];
 // Unknown or unusable messages in a row, with no accepted share between them.
@@ -61,6 +64,8 @@ export interface ISv2ConnectionOptions {
     logShares: boolean;
     connLog: boolean;
     authTimeoutSeconds: number;
+    /** After the Noise handshake and SetupConnection: how long with no channel, and with no traffic, before closing. */
+    idleAfterSetupSeconds?: number;
 }
 
 /** User agent as the pool shows it: vendor/hardware, marked as SV2. Printable ASCII only. */
@@ -294,6 +299,15 @@ export class Sv2Connection {
         // Version rolling is allowed and extended channels are not required: flags 0.
         await this.send(enc.setupConnectionSuccess({ usedVersion: 2, flags: 0 }));
         this.state = 'ready';
+        // Set up and authenticated: the 30 s login deadline gives way to a longer
+        // one, for channels and for traffic both (a proxy with no miners yet).
+        const idle = this.options.idleAfterSetupSeconds ?? DEFAULT_IDLE_AFTER_SETUP_SECONDS;
+        if (this.authTimer) clearTimeout(this.authTimer);
+        this.authTimer = setTimeout(() => {
+            if (this.channels.size === 0) this.close('no-channel-timeout');
+        }, idle * 1000);
+        this.authTimer.unref?.();
+        this.socket.setTimeout(idle * 1000);
     }
 
     private newChannel(id: number, type: Sv2ChannelType): Sv2Channel {

@@ -15,7 +15,7 @@ import { PayoutService } from '../splash/payout.service';
 import { IAuthorityKey, loadAuthorityFile } from './authority';
 import { ellswiftKeygen, IEllSwiftKeypair } from './ellswift';
 import { signCertificate } from './noise';
-import { DEFAULT_MAX_CHANNELS_PER_CONNECTION, IChannelBudget, Sv2Connection } from './sv2-connection';
+import { DEFAULT_IDLE_AFTER_SETUP_SECONDS, DEFAULT_MAX_CHANNELS_PER_CONNECTION, IChannelBudget, Sv2Connection } from './sv2-connection';
 
 const DEFAULT_CERT_VALIDITY_SECONDS = 24 * 60 * 60;
 // Channels one IP may hold over all its connections (a proxy for a farm is one IP).
@@ -105,11 +105,11 @@ export class StratumV2Service implements OnModuleInit {
         return signCertificate(this.authority.secret, this.staticKey.publicKey, now - CERT_BACKDATE_SECONDS, now + validity);
     }
 
-    /** A whole number from 1 to CHANNEL_LIMIT_CEILING, else the default. */
-    private limit(key: string, fallback: number): number {
+    /** A whole number from min to max, else the default. */
+    private limit(key: string, fallback: number, min = 1, max = CHANNEL_LIMIT_CEILING): number {
         const raw = this.configService.get(key);
         const n = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw);
-        if (Number.isInteger(n) && n >= 1 && n <= CHANNEL_LIMIT_CEILING) return n;
+        if (Number.isInteger(n) && n >= min && n <= max) return n;
         if (raw != null && `${raw}`.trim() !== '') console.warn(`Ignoring invalid ${key}=${raw}`);
         return fallback;
     }
@@ -127,11 +127,13 @@ export class StratumV2Service implements OnModuleInit {
         const authTimeout = Number(this.configService.get('SPLASH_AUTH_TIMEOUT_SECONDS'));
         const perConnection = this.limit('SV2_MAX_CHANNELS_PER_CONNECTION', DEFAULT_MAX_CHANNELS_PER_CONNECTION);
         const perIp = this.limit('SV2_MAX_CHANNELS_PER_IP', DEFAULT_MAX_CHANNELS_PER_IP);
-        console.log(`Stratum V2 channels: at most ${perConnection} per connection, ${perIp} per IP`);
+        const idleAfterSetup = this.limit('SV2_IDLE_AFTER_SETUP_SECONDS', DEFAULT_IDLE_AFTER_SETUP_SECONDS, 30, 24 * 60 * 60);
+        console.log(`Stratum V2 channels: at most ${perConnection} per connection, ${perIp} per IP; set-up connections may idle ${idleAfterSetup} s`);
         const options = {
             staticKey: this.staticKey,
             maxChannelsPerConnection: perConnection,
             channelBudget: new ChannelBudget(perIp),
+            idleAfterSetupSeconds: idleAfterSetup,
             certificate: () => this.certificate(),
             logShares: this.flag('SV2_LOG_SHARES', this.configService.get('NETWORK') !== 'mainnet'),
             connLog: this.flag('SPLASH_CONN_LOG', false),
