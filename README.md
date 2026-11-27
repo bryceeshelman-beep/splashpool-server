@@ -65,6 +65,14 @@ It's for testing: coins have no value, the pool may be reset, and abuse limits
 are strict (temporary bans are expected). See [TESTING.md](TESTING.md) for what
 to try.
 
+## Stratum V2
+
+Splashpool can also take **Stratum V2** miners (Mining Protocol, encrypted,
+Standard and Extended channels) on a port of its own, beside Stratum V1. It's
+off by default. SV2 miners get exactly the same rules and payouts as V1
+miners. Operator setup, and which channel type to choose in AxeOS, are in
+[docs/STRATUM-V2.md](docs/STRATUM-V2.md).
+
 ## Setup
 
 You need:

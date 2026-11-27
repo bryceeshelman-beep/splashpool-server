@@ -122,6 +122,32 @@ All dates are UTC.
 - `GET /api/site/poolstats` for pool-listing sites.
 - CORS preflight allows common request headers.
 
+## Stratum V2
+
+**2026-11-27**
+- Optional **Stratum V2 Mining Protocol** listener on its own port, off unless
+  `SV2_ENABLED=true` (see `docs/STRATUM-V2.md`). V1 is unchanged.
+- Upstream's per-connection pool logic (jobs, share checks, vardiff, payouts,
+  statistics) moved from `StratumV1Client` into a protocol-neutral
+  `src/models/MinerSession.ts`, which both V1 and SV2 use. So an SV2 miner gets
+  exactly the same Splash Bonus, fee and split as a V1 miner.
+- New in `src/sv2/`:
+  - `ellswift.ts`: BIP324 ElligatorSwift, on `@scure/btc-signer` (MIT), checked against the BIP324 test vectors.
+  - `noise.ts`: Noise_NX_Secp256k1+EllSwift_ChaChaPoly_SHA256 responder, with a signed certificate.
+  - `codec.ts`: frames and messages.
+  - `authority.ts` and `scripts/sv2-keygen.js`: the authority key file and its base58-check public key.
+  - `sv2-channel.ts`, `sv2-connection.ts`, `stratum-v2.service.ts`: Standard and Extended channels, SetTarget vardiff, per-IP limits.
+- Channel difficulties are whole powers of two, so Bitaxe firmware reads
+  them exactly. Vardiff never makes an already-sent future job harder.
+- Standard channels get a new job before the miner can run out of work, so
+  no duplicate shares.
+- `MiningJob`: coinbase halves and a merkle-root helper. `@scure/btc-signer`
+  added as a dependency.
+- Codec test vectors come from ESP-Miner v2.14.0's `sv2_protocol.c`
+  (https://github.com/bitaxeorg/ESP-Miner, GPL-3.0): outputs only. BIP324
+  test vectors are unchanged (BSD-3-Clause). See `src/sv2/testdata/README.md`.
+- Not included: Job Declaration, Template Distribution, group channels.
+
 ## Tools and docs
 
 - **2026-11-19**: `scripts/check-coinbase.py` connects as a miner, decodes the
@@ -148,7 +174,8 @@ All dates are UTC.
   the minimum-payout drop, a reward smaller than the Splash Bonus, a tiny
   shared part, a single miner, a block found in a miner's first second,
   shares arriving at the moment of the block, and a block with real
-  transaction fees. `TESTING.md` lists what we want
+  transaction fees. **2026-11-27**: case J has Stratum V2 miners (Standard
+  and Extended channels) find blocks, using `scripts/sv2-test-miner.js`. `TESTING.md` lists what we want
   testers to try.
 
 Many tests were added alongside these changes (`*.spec.ts` under `src/`).
