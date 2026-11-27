@@ -154,11 +154,17 @@ export class Sv2Channel extends MinerSession {
     }
 
     protected async applyNewDifficulty(targetDiff: number) {
-        // Spec 5.3.21: the new target covers jobs that arrived as future jobs; jobs
-        // sent with ntime_start keep theirs. Shares are still judged and credited
-        // at the difficulty their job holds, so nothing earns more than it met.
+        // Jobs sent with ntime_start keep their target (spec 5.3.21), and shares
+        // on them are judged and credited at it. Jobs that arrived as future jobs
+        // are ambiguous: the spec moves them to the new target, but Bitaxe
+        // firmware (v2.14/v2.15) fixes a job's difficulty when it starts mining
+        // it, so it keeps working at the old one until the refresh job below
+        // arrives. Such a job only ever moves DOWN: then neither reading gets a
+        // valid share rejected, and nobody is credited above what they were
+        // asked for (a raise is credited at the old, lower difficulty).
         for (const poolId of this.futureJobs) {
-            if (this.issuedJobs.has(poolId)) this.issuedJobs.set(poolId, targetDiff);
+            const issued = this.issuedJobs.get(poolId);
+            if (issued != null && targetDiff < issued) this.issuedJobs.set(poolId, targetDiff);
         }
         const ok = await this.link.send(enc.setTarget({ channelId: this.channelId, maximumTarget: difficultyToTarget(targetDiff) }));
         if (!ok) return;
