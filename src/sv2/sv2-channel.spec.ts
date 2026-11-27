@@ -24,7 +24,7 @@ import { StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { FoundBlocksService } from '../splash/found-blocks';
 import { dec, difficultyToTarget, MSG, targetToDifficulty } from './codec';
 import { TRUE_DIFF_ONE } from '../models/MinerSession';
-import { SV2_MAX_DIFFICULTY, Sv2Channel, Sv2ChannelType, sv2Difficulty } from './sv2-channel';
+import { STANDARD_REFRESH_MAX_SECONDS, standardRefreshSeconds, SV2_MAX_DIFFICULTY, Sv2Channel, Sv2ChannelType, sv2Difficulty } from './sv2-channel';
 
 jest.mock('../services/bitcoin-rpc.service');
 
@@ -71,9 +71,9 @@ describe('Sv2Channel: vardiff mid-job', () => {
         await moduleRef.close();
     });
 
-    function makeChannel(type: Sv2ChannelType): Sv2Channel {
+    function makeChannel(type: Sv2ChannelType, template: any = MockRecording1.BLOCK_TEMPLATE): Sv2Channel {
         const bitcoinRpcService = new BitcoinRpcService(configService, null);
-        jest.spyOn(bitcoinRpcService, 'getBlockTemplate').mockResolvedValue(MockRecording1.BLOCK_TEMPLATE);
+        jest.spyOn(bitcoinRpcService, 'getBlockTemplate').mockResolvedValue(template);
         bitcoinRpcService.newBlock$ = new BehaviorSubject({ blocks: MockRecording1.BLOCK_TEMPLATE.height } as IMiningInfo).asObservable();
         const jobs = new StratumV1JobsService(bitcoinRpcService);
 
@@ -97,8 +97,8 @@ describe('Sv2Channel: vardiff mid-job', () => {
         return channel;
     }
 
-    async function openChannel(type: Sv2ChannelType, startDifficulty: number) {
-        makeChannel(type);
+    async function openChannel(type: Sv2ChannelType, startDifficulty: number, template?: any) {
+        makeChannel(type, template);
         // nominal hash rate for one share per 10 s at startDifficulty.
         const target = channel.open(ADDRESS, 'bitaxe', 'bitaxe/BM1370 (SV2)', startDifficulty * 2 ** 32 / 10, Buffer.alloc(32, 0xff));
         expect(targetToDifficulty(target)).toBeCloseTo(startDifficulty, 6);
@@ -315,6 +315,124 @@ describe('Sv2Channel: vardiff mid-job', () => {
                 }
             }
             expect(checked).toBeGreaterThanOrEqual(4);
+        });
+    });
+
+    describe('Standard channels get new work before the miner runs out (no duplicate shares)', () => {
+        // The miner rolls nothing but nonce and version bits: one job is 2^32 x 2^16
+        // hashes, a few minutes for a 2 TH/s Bitaxe, after which it re-finds the same
+        // shares. testnet4 can go many minutes without a template change.
+        const warnSpy = () => logSpies[1];
+        // Like testnet4: mintime ahead of the clock, so the pool's 60 s template poll
+        // sees identical work and sends nothing (on mainnet the timestamp moves).
+        const quietTemplate = () => ({ ...MockRecording1.BLOCK_TEMPLATE, mintime: Math.floor(Date.now() / 1000) + 3600 });
+        const newJobs = (from: number) => jobs().slice(from);
+
+        async function submitFixedNonce(jobId: number, ntime: number, version: number, headers: Buffer[]) {
+            jest.spyOn(channel as any, 'calculateDifficulty').mockImplementationOnce((h: Buffer) => {
+                headers.push(Buffer.from(h));
+                return { submissionDifficulty: 1e6, submissionHash: '' };
+            });
+            const before = sent.length;
+            await channel.submit({ channelId: 1, sequenceNumber: nonce++, jobId, nonce: 0x12345678, ntime, version }, false);
+            const reply = sent.slice(before).find(m => m.type === MSG.SubmitSharesSuccess || m.type === MSG.SubmitSharesError);
+            return reply.type === MSG.SubmitSharesSuccess ? 'ok' : dec.submitSharesError(reply.payload).errorCode;
+        }
+
+        it('refresh interval: from the hashrate, at most 30 s, with a warning above about 70 TH/s', () => {
+            expect(standardRefreshSeconds(1.2e12)).toEqual({ seconds: STANDARD_REFRESH_MAX_SECONDS, tooFast: false }); // Bitaxe Gamma
+            expect(standardRefreshSeconds(2.1e12)).toEqual({ seconds: 30, tooFast: false }); // ~34 s wanted, capped
+            expect(standardRefreshSeconds(1e13).seconds).toBeCloseTo(2 ** 48 / 1e13 / 4, 6); // ~7 s
+            expect(standardRefreshSeconds(7e13)).toEqual({ seconds: 2 ** 48 / 7e13 / 4, tooFast: false }); // ~1.005 s
+            expect(standardRefreshSeconds(2e14)).toEqual({ seconds: 1, tooFast: true }); // S21-class: Extended territory
+            expect(standardRefreshSeconds(0)).toEqual({ seconds: 10, tooFast: false }); // nothing known yet
+            expect(standardRefreshSeconds(NaN)).toEqual({ seconds: 10, tooFast: false });
+        });
+
+        it('template unchanged for 5 minutes: a Bitaxe-size miner keeps getting new, unique work, and its shares stay valid', async () => {
+            jest.useFakeTimers({ advanceTimers: true });
+            try {
+                await openChannel('standard', 4096, quietTemplate()); // ~1.8 TH/s claimed
+                jest.spyOn((channel as any).statistics, 'getSuggestedDifficulty').mockReturnValue(null); // no vardiff jobs
+                const rpc = (channel as any).bitcoinRpcService;
+                const polls = (rpc.getBlockTemplate as jest.Mock).mock.calls.length;
+                const before = jobs().length;
+
+                await jest.advanceTimersByTimeAsync(5 * 60_000);
+
+                const fresh = newJobs(before);
+                // The template was polled and never changed: every job here is a refresh.
+                expect((rpc.getBlockTemplate as jest.Mock).mock.calls.length).toBeGreaterThan(polls);
+                expect(sent.filter(m => m.type === MSG.SetNewPrevHash)).toHaveLength(1);
+                expect(fresh.length).toBeGreaterThanOrEqual(10); // 300 s at <= 30 s
+                expect(fresh.every(j => j.minNtime !== null)).toBe(true); // current jobs: switch now
+                // Every job is different work, even with the same template and ntime.
+                const roots = jobs().map(j => j.merkleRoot.toString('hex'));
+                expect(new Set(roots).size).toBe(roots.length);
+                expect(new Set(fresh.map(j => j.minNtime)).size).toBe(1); // the ntime did NOT change: the coinbase did
+            } finally {
+                jest.useRealTimers();
+            }
+            const fresh = jobs();
+            const [a, b] = fresh.slice(-2);
+            const headers: Buffer[] = [];
+            // The same nonce/ntime/version on two refresh jobs is two different shares...
+            expect(await submitFixedNonce(a.jobId, a.minNtime, a.version, headers)).toBe('ok');
+            expect(await submitFixedNonce(b.jobId, b.minNtime, b.version, headers)).toBe('ok');
+            // ...and the pool judged exactly the work it sent (its header carries that job's merkle root).
+            expect(headers[0].subarray(36, 68).equals(a.merkleRoot)).toBe(true);
+            expect(headers[1].subarray(36, 68).equals(b.merkleRoot)).toBe(true);
+            // Repeating one is still a duplicate.
+            expect(await submitFixedNonce(a.jobId, a.minNtime, a.version, headers)).toBe('duplicate-share');
+            expect(warnSpy().mock.calls.filter(c => `${c[0]}`.includes('Extended'))).toHaveLength(0);
+        });
+
+        it('paces refreshes by the MEASURED hashrate once there is one', async () => {
+            jest.useFakeTimers({ advanceTimers: true });
+            try {
+                await openChannel('standard', 4096, quietTemplate()); // claims ~1.8 TH/s -> 30 s
+                jest.spyOn((channel as any).statistics, 'getSuggestedDifficulty').mockReturnValue(null);
+                (channel as any).statistics.hashRate = 1e13; // but really does 10 TH/s -> ~7 s
+                let before = jobs().length;
+                await jest.advanceTimersByTimeAsync(30_500); // the first timer was set from the claimed rate
+                expect(newJobs(before)).toHaveLength(1);
+                before = jobs().length;
+                await jest.advanceTimersByTimeAsync(7_500); // from now on, from the measured one
+                expect(newJobs(before)).toHaveLength(1);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('large-miner hashrate: refreshes once a second and warns once to use Extended; an Extended channel needs none', async () => {
+            jest.useFakeTimers({ advanceTimers: true });
+            try {
+                await openChannel('standard', 2 ** 19, quietTemplate()); // ~225 TH/s claimed
+                jest.spyOn((channel as any).statistics, 'getSuggestedDifficulty').mockReturnValue(null);
+                const before = jobs().length;
+                await jest.advanceTimersByTimeAsync(10_000);
+                const fresh = newJobs(before);
+                expect(fresh.length).toBeGreaterThanOrEqual(9);
+                expect(fresh.length).toBeLessThanOrEqual(11);
+                const roots = jobs().map(j => j.merkleRoot.toString('hex'));
+                expect(new Set(roots).size).toBe(roots.length);
+                const warnings = warnSpy().mock.calls.filter(c => `${c[0]}`.includes('use an Extended channel'));
+                expect(warnings).toHaveLength(1);
+                expect(warnings[0][0]).toContain(`${ADDRESS}.bitaxe`);
+                await channel.close();
+
+                // Extended: the miner rolls its own extranonce, so no refreshes and no warning.
+                sent = [];
+                warnSpy().mockClear();
+                await openChannel('extended', 2 ** 19, quietTemplate());
+                jest.spyOn((channel as any).statistics, 'getSuggestedDifficulty').mockReturnValue(null);
+                const ext = sent.filter(m => m.type === MSG.NewExtendedMiningJob).length;
+                await jest.advanceTimersByTimeAsync(60_000);
+                expect(sent.filter(m => m.type === MSG.NewExtendedMiningJob).length).toBe(ext);
+                expect(warnSpy().mock.calls.filter(c => `${c[0]}`.includes('Extended'))).toHaveLength(0);
+            } finally {
+                jest.useRealTimers();
+            }
         });
     });
 });

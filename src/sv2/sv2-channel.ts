@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { Socket } from 'net';
+import { firstValueFrom } from 'rxjs';
 
 import { MinerSession, ShareRejectReason } from '../models/MinerSession';
 import { StratumV1ClientStatistics } from '../models/StratumV1ClientStatistics';
@@ -41,6 +42,30 @@ export const BITAXE_V214_MAX_PAYLOAD = 2048;
 export const SV2_MIN_DIFFICULTY = 1;
 export const SV2_MAX_DIFFICULTY = 2 ** 31;
 
+// A Standard-channel miner can't make new work: it searches one job's merkle
+// root over 2^32 nonces x 2^16 version-rolling values (mask 0x1fffe000), then
+// starts over and finds the same shares again (duplicates). So the pool sends
+// a new job, which is always a new coinbase (MiningJob puts its job id in the
+// coinbase nSequence), before that can happen.
+export const STANDARD_JOB_SEARCH_SPACE = 2 ** 32 * 2 ** 16;
+export const STANDARD_REFRESH_MAX_SECONDS = 30;
+export const STANDARD_REFRESH_MIN_SECONDS = 1;
+// Refresh after a quarter of the search space, leaving room for a miner faster
+// than measured or rolling fewer version bits.
+const STANDARD_REFRESH_SAFETY = 4;
+// No hashrate known at all (none claimed or measured yet).
+const STANDARD_REFRESH_UNKNOWN_SECONDS = 10;
+
+/** How often a Standard channel at this hashrate (H/s) needs new work; tooFast: more often than once a second. */
+export function standardRefreshSeconds(hashrate: number): { seconds: number, tooFast: boolean } {
+    if (!Number.isFinite(hashrate) || !(hashrate > 0)) return { seconds: STANDARD_REFRESH_UNKNOWN_SECONDS, tooFast: false };
+    const wanted = STANDARD_JOB_SEARCH_SPACE / hashrate / STANDARD_REFRESH_SAFETY;
+    return {
+        seconds: Math.min(STANDARD_REFRESH_MAX_SECONDS, Math.max(STANDARD_REFRESH_MIN_SECONDS, wanted)),
+        tooFast: wanted < STANDARD_REFRESH_MIN_SECONDS,
+    };
+}
+
 /**
  * The SV2 difficulty for a wanted one: the nearest power of two (as vardiff
  * steps), within [lower, upper] rounded inward to powers of two, and within
@@ -81,6 +106,9 @@ export class Sv2Channel extends MinerSession {
     // SV2 job ids are per channel; the pool's are global hex strings.
     private nextSv2JobId = 1;
     private readonly sv2ToPoolJob = new Map<number, string>();
+    private refreshTimer: NodeJS.Timeout = null;
+    private refreshTooFastWarned = false;
+    private nominalHashRate = 0;
     // Pool job ids sent as future jobs: SetTarget applies to these too (spec 5.3.21).
     private readonly futureJobs = new Set<string>();
     private lastPrevHash: Buffer = null;
@@ -143,6 +171,7 @@ export class Sv2Channel extends MinerSession {
         this.statistics = new StratumV1ClientStatistics(this.clientStatisticsService);
         this.extraNonceAndSessionId = this.getRandomHexString();
         this.clientMinDifficulty = targetToDifficulty(maxTarget);
+        this.nominalHashRate = Number.isFinite(nominalHashRate) && nominalHashRate > 0 ? nominalHashRate : 0;
         this.sessionDifficulty = this.clampDifficulty(this.startingDifficulty(nominalHashRate));
         return difficultyToTarget(this.sessionDifficulty);
     }
@@ -225,6 +254,9 @@ export class Sv2Channel extends MinerSession {
         if (this.type === 'standard') {
             jobFrame = enc.newMiningJob({
                 channelId: this.channelId, jobId: sv2JobId, minNtime, version,
+                // Every MiningJob's coinbase carries its own job id (nSequence), so each
+                // job, a refresh included, is a new merkle root: new work, even with the
+                // same template and ntime.
                 merkleRoot: job.merkleRoot(this.extraNonceAndSessionId, '00'.repeat(EXTRANONCE2_SIZE_BYTES)),
             });
         } else {
@@ -245,6 +277,45 @@ export class Sv2Channel extends MinerSession {
             this.lastPrevHashNtime = ntime;
         }
         this.lastSentMiningJobTimestamp = ntime;
+        this.scheduleStandardRefresh();
+    }
+
+    /** The hashrate refreshes are paced for: measured once there is one, else what the miner claimed. */
+    private get refreshHashRate(): number {
+        const measured = this.statistics?.hashRate;
+        return Number.isFinite(measured) && measured > 0 ? measured : this.nominalHashRate;
+    }
+
+    /** Standard channels: new work before the miner can run out of the current job. Restarted by every job sent. */
+    private scheduleStandardRefresh() {
+        if (this.type !== 'standard' || this.connectionClosed) return;
+        if (this.refreshTimer != null) clearTimeout(this.refreshTimer);
+        const hashrate = this.refreshHashRate;
+        const { seconds, tooFast } = standardRefreshSeconds(hashrate);
+        if (tooFast && !this.refreshTooFastWarned) {
+            this.refreshTooFastWarned = true;
+            console.warn(`SV2: Standard channel for ${this.address}.${this.worker} at ${(hashrate / 1e12).toFixed(1)} TH/s would need new work `
+                + `more than once a second to avoid duplicate shares; use an Extended channel (AxeOS v2.15+ or any larger miner)`);
+        }
+        this.refreshTimer = setTimeout(() => {
+            this.refreshTimer = null;
+            this.refreshStandardJob().catch(e => {
+                console.error('SV2: could not refresh a Standard job', e);
+                this.scheduleStandardRefresh();
+            });
+        }, seconds * 1000);
+        this.refreshTimer.unref?.();
+    }
+
+    private async refreshStandardJob() {
+        if (this.connectionClosed) return;
+        // While jobs are held (payouts not ready), there is nothing to send yet.
+        if (this.payoutService?.enabled && !this.payoutService.ready) {
+            this.scheduleStandardRefresh();
+            return;
+        }
+        // Same template, older jobs stay valid: a new job, so a new coinbase (its job id in nSequence).
+        await this.sendNewMiningJob(await firstValueFrom(this.stratumV1JobsService.newMiningJob$));
     }
 
     /** Bitaxe v2.14.x can't take extended jobs over 2 KB; v2.15+ can (8 KB). Logged once per address. */
@@ -253,7 +324,7 @@ export class Sv2Channel extends MinerSession {
         if (Sv2Channel.bigJobWarned.has(this.address)) return;
         if (Sv2Channel.bigJobWarned.size > 10000) Sv2Channel.bigJobWarned.clear();
         Sv2Channel.bigJobWarned.add(this.address);
-        console.warn(`SV2: extended job for ${this.address}.${this.worker} is ${payloadBytes} bytes; AxeOS before v2.15 drops jobs over ${BITAXE_V214_MAX_PAYLOAD} bytes (use a Standard channel or update AxeOS)`);
+        console.warn(`SV2: extended job for ${this.address}.${this.worker} is ${payloadBytes} bytes; if it runs AxeOS before v2.15 it drops jobs over ${BITAXE_V214_MAX_PAYLOAD} bytes (update AxeOS to v2.15+, or use a Standard channel on v2.14)`);
     }
 
     /** SubmitSharesStandard / SubmitSharesExtended for this channel. */
@@ -324,6 +395,8 @@ export class Sv2Channel extends MinerSession {
     /** Closes this channel's miner session (not the connection). */
     public async close() {
         this.connectionClosed = true;
+        if (this.refreshTimer != null) clearTimeout(this.refreshTimer);
+        this.refreshTimer = null;
         await this.destroy();
     }
 }
