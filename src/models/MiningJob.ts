@@ -126,6 +126,26 @@ export class MiningJob {
 
     }
 
+    /** Stratum V2: the coinbase before the extranonce (non-witness serialization). */
+    public get coinbasePrefix(): Buffer {
+        return this.coinbasePart1Buffer;
+    }
+
+    /** Stratum V2: the coinbase after the extranonce. */
+    public get coinbaseSuffix(): Buffer {
+        return this.coinbasePart2Buffer;
+    }
+
+    /** Stratum V2 standard jobs: the merkle root for this coinbase with the given extranonce (hex). */
+    public merkleRoot(extraNonce: string, extraNonce2: string): Buffer {
+        const coinbaseBuffer = Buffer.concat([
+            this.coinbasePart1Buffer,
+            Buffer.from(`${extraNonce}${extraNonce2}`, 'hex'),
+            this.coinbasePart2Buffer,
+        ]);
+        return this.calculateMerkleRootHash(bitcoinjs.crypto.hash256(coinbaseBuffer), this.merkleBranchBuffers);
+    }
+
     public cloneCoinbaseTransaction(): bitcoinjs.Transaction {
         return bitcoinjs.Transaction.fromBuffer(this.coinbaseTransaction.toBuffer());
     }
