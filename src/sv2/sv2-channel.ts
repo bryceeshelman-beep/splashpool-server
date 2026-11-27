@@ -32,6 +32,29 @@ const SV2_REJECT_CODES: Record<ShareRejectReason, string> = {
 // Bitaxe v2.14.x drops any incoming SV2 message over this many bytes.
 export const BITAXE_V214_MAX_PAYLOAD = 2048;
 
+// AxeOS v2.14.x reads a target as a whole difficulty: sv2_target_to_pdiff()
+// truncates to uint32, at least 1 and at most 2^32-1 (v2.15 keeps a double).
+// So every SV2 difficulty is a power of two from 1 to 2^31: whole, sent as an
+// exact target, and read back by the firmware as exactly the same number.
+// Anything else and the firmware mines easier than the pool judges (2328.3 is
+// read as 2328), and the shares in between are rejected.
+export const SV2_MIN_DIFFICULTY = 1;
+export const SV2_MAX_DIFFICULTY = 2 ** 31;
+
+/**
+ * The SV2 difficulty for a wanted one: the nearest power of two (as vardiff
+ * steps), within [lower, upper] rounded inward to powers of two, and within
+ * [1, 2^31]. If the bounds cross, the lower one wins, as in V1.
+ */
+export function sv2Difficulty(wanted: number, lower: number, upper: number): number {
+    const lo = 2 ** Math.ceil(Math.log2(Math.min(Math.max(lower || 0, SV2_MIN_DIFFICULTY), SV2_MAX_DIFFICULTY)));
+    const hi = 2 ** Math.floor(Math.log2(Math.max(Math.min(upper > 0 ? upper : Infinity, SV2_MAX_DIFFICULTY), SV2_MIN_DIFFICULTY)));
+    if (hi < lo) return lo;
+    if (!Number.isFinite(wanted) || !(wanted > 0)) return lo;
+    const nearest = 2 ** Math.round(Math.log2(wanted));
+    return Math.min(Math.max(nearest, lo), hi);
+}
+
 /** What a channel needs from its connection. */
 export interface ISv2ChannelLink {
     /** Encrypts and writes one plaintext frame. False if the connection is gone. */
@@ -143,14 +166,15 @@ export class Sv2Channel extends MinerSession {
         if (!(nominalHashRate > 0) || !Number.isFinite(nominalHashRate)) {
             return this.sessionDifficulty;
         }
-        const d = nominalHashRate * 10 / 2 ** 32;
-        // Powers of two, like vardiff's own steps.
-        return d >= 1 ? 2 ** Math.round(Math.log2(d)) : d;
+        // Rounded to a power of two by clampDifficulty (1 TH/s: 2328.3 -> 2048).
+        return nominalHashRate * 10 / 2 ** 32;
     }
 
+    /** Every difficulty this channel uses (start, vardiff, UpdateChannel) comes through here. */
     protected clampDifficulty(difficulty: number): number {
-        // Never easier than the miner's max_target allows (spec 5.3.21).
-        return Math.max(super.clampDifficulty(difficulty), this.clientMinDifficulty);
+        // The pool's floor and cap, and never easier than the miner's max_target allows (spec 5.3.21).
+        if (!Number.isFinite(difficulty)) difficulty = this.minDifficulty;
+        return sv2Difficulty(difficulty, Math.max(this.minDifficulty, this.clientMinDifficulty), this.maxDifficulty);
     }
 
     protected async applyNewDifficulty(targetDiff: number) {
