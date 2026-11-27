@@ -74,7 +74,7 @@ describe('SV2 codec', () => {
             ['submitSharesSuccess', { channelId: 1, lastSequenceNumber: 2, newSubmitsAcceptedCount: 3, newSharesSum: 2n ** 63n }],
         ];
         for (const [type, msg] of samples) {
-            const f = enc[type](msg);
+            const f = (enc as any)[type](msg) as Buffer;
             const back = (dec as any)[type](f.subarray(6));
             expect(back).toEqual(msg);
         }

@@ -39,6 +39,22 @@ const CHANNEL_MESSAGES = new Set<number>([
     MSG.SetNewPrevHash, MSG.SetTarget, MSG.SetCustomMiningJob,
 ]);
 
+// Extensions (sv2-spec extensions/): the frame's extension_type names the
+// extension that defined the message.
+export const EXT = {
+    Negotiation: 0x0001,
+    WorkerHashrateTracking: 0x0002,
+} as const;
+// Messages of extension 0x0001 (no channel_msg bit).
+export const EXT_NEGOTIATION_MSG = {
+    RequestExtensions: 0x00,
+    RequestExtensionsSuccess: 0x01,
+    RequestExtensionsError: 0x02,
+} as const;
+// Extension 0x0002's TLV on SubmitSharesExtended: field 0x01 is the worker's user_identity, at most 32 bytes.
+export const WORKER_IDENTITY_FIELD = 0x01;
+export const MAX_TLV_WORKER_IDENTITY_BYTES = 32;
+
 export function isChannelMessage(msgType: number): boolean {
     return CHANNEL_MESSAGES.has(msgType);
 }
@@ -82,6 +98,13 @@ export class Writer {
         if (v == null) return this.u8(0);
         return this.u8(1).u32(v);
     }
+    seq0_64k_u16(list: number[]) {
+        if (list.length > 65535) throw new Error(`SEQ0_64K too long: ${list.length}`);
+        this.u16(list.length);
+        list.forEach(x => this.u16(x));
+        return this;
+    }
+    raw(v: Buffer) { this.parts.push(Buffer.from(v)); return this; }
     build(): Buffer { return Buffer.concat(this.parts); }
 }
 
@@ -136,6 +159,15 @@ export class Reader {
         if (tag !== 1) throw new Sv2DecodeError(`invalid OPTION tag ${tag}`);
         return this.u32();
     }
+    seq0_64k_u16(): number[] {
+        const n = this.u16();
+        const out: number[] = [];
+        for (let i = 0; i < n; i++) out.push(this.u16());
+        return out;
+    }
+    /** Everything not read yet (consumes it). */
+    rest(): Buffer { return Buffer.from(this.take(this.buf.length - this.pos)); }
+    atEnd() { return this.pos === this.buf.length; }
     end() {
         if (this.pos !== this.buf.length) {
             throw new Sv2DecodeError(`${this.buf.length - this.pos} trailing bytes`);
@@ -168,7 +200,44 @@ export function frame(msgType: number, payload: Buffer): Buffer {
     return Buffer.concat([encodeFrameHeader({ extensionType, msgType, msgLength: payload.length }), payload]);
 }
 
+/** A frame of an extension's own (non-channel) message. */
+export function extensionFrame(extensionType: number, msgType: number, payload: Buffer): Buffer {
+    return Buffer.concat([encodeFrameHeader({ extensionType, msgType, msgLength: payload.length }), payload]);
+}
+
+// ── TLV fields (sv2-spec 03, 3.4.3) ──────────────────────────────────
+// Type = extension_type U16 + field_type U8, then Length U16, then Value.
+// Little-endian like every SV2 U16 (and as SRI encodes them).
+
+export interface ITlv { extensionType: number; fieldType: number; value: Buffer; }
+
+export function encodeTlvs(tlvs: ITlv[]): Buffer {
+    const w = new Writer();
+    for (const t of tlvs) {
+        if (t.value.length > 0xffff) throw new Error(`TLV value too long: ${t.value.length}`);
+        w.u16(t.extensionType).u8(t.fieldType).u16(t.value.length).raw(t.value);
+    }
+    return w.build();
+}
+
+/** Parses trailing TLV fields strictly: anything that isn't a whole TLV list is an error. */
+export function decodeTlvs(b: Buffer): ITlv[] {
+    const r = new Reader(b);
+    const out: ITlv[] = [];
+    while (!r.atEnd()) {
+        const extensionType = r.u16();
+        const fieldType = r.u8();
+        const value = r.b0_64k();
+        out.push({ extensionType, fieldType, value });
+    }
+    return out;
+}
+
 // ── Messages ─────────────────────────────────────────────────────────
+
+export interface RequestExtensions { requestId: number; requestedExtensions: number[]; }
+export interface RequestExtensionsSuccess { requestId: number; supportedExtensions: number[]; }
+export interface RequestExtensionsError { requestId: number; unsupportedExtensions: number[]; requiredExtensions: number[]; }
 
 export interface SetupConnection {
     protocol: number; minVersion: number; maxVersion: number; flags: number;
@@ -232,6 +301,18 @@ export const enc = {
     setNewPrevHash: (m: SetNewPrevHash) => frame(MSG.SetNewPrevHash, new Writer()
         .u32(m.channelId).u32(m.jobId).u256(m.prevHash).u32(m.minNtime).u32(m.nbits).build()),
     setTarget: (m: SetTarget) => frame(MSG.SetTarget, new Writer().u32(m.channelId).u256(m.maximumTarget).build()),
+    requestExtensions: (m: RequestExtensions) => extensionFrame(EXT.Negotiation, EXT_NEGOTIATION_MSG.RequestExtensions,
+        new Writer().u16(m.requestId).seq0_64k_u16(m.requestedExtensions).build()),
+    requestExtensionsSuccess: (m: RequestExtensionsSuccess) => extensionFrame(EXT.Negotiation, EXT_NEGOTIATION_MSG.RequestExtensionsSuccess,
+        new Writer().u16(m.requestId).seq0_64k_u16(m.supportedExtensions).build()),
+    requestExtensionsError: (m: RequestExtensionsError) => extensionFrame(EXT.Negotiation, EXT_NEGOTIATION_MSG.RequestExtensionsError,
+        new Writer().u16(m.requestId).seq0_64k_u16(m.unsupportedExtensions).seq0_64k_u16(m.requiredExtensions).build()),
+    /** SubmitSharesExtended with TLV fields appended (extension 0x0002 and others). */
+    submitSharesExtendedWithTlvs: (m: SubmitSharesExtended, tlvs: ITlv[]) => {
+        const f = enc.submitSharesExtended(m);
+        const payload = Buffer.concat([f.subarray(SV2_FRAME_HEADER_SIZE), encodeTlvs(tlvs)]);
+        return frame(MSG.SubmitSharesExtended, payload);
+    },
 };
 
 function decodeWith<T>(payload: Buffer, f: (r: Reader) => T): T {
@@ -270,6 +351,18 @@ export const dec = {
     })),
     submitSharesExtended: (p: Buffer): SubmitSharesExtended => decodeWith(p, r => ({
         channelId: r.u32(), sequenceNumber: r.u32(), jobId: r.u32(), nonce: r.u32(), ntime: r.u32(), version: r.u32(), extranonce: r.b0_32(),
+    })),
+    /** SubmitSharesExtended plus any TLV fields after it (each must be well formed). */
+    submitSharesExtendedWithTlvs: (p: Buffer): { share: SubmitSharesExtended, tlvs: ITlv[] } => decodeWith(p, r => ({
+        share: {
+            channelId: r.u32(), sequenceNumber: r.u32(), jobId: r.u32(), nonce: r.u32(), ntime: r.u32(), version: r.u32(), extranonce: r.b0_32(),
+        },
+        tlvs: decodeTlvs(r.rest()),
+    })),
+    requestExtensions: (p: Buffer): RequestExtensions => decodeWith(p, r => ({ requestId: r.u16(), requestedExtensions: r.seq0_64k_u16() })),
+    requestExtensionsSuccess: (p: Buffer): RequestExtensionsSuccess => decodeWith(p, r => ({ requestId: r.u16(), supportedExtensions: r.seq0_64k_u16() })),
+    requestExtensionsError: (p: Buffer): RequestExtensionsError => decodeWith(p, r => ({
+        requestId: r.u16(), unsupportedExtensions: r.seq0_64k_u16(), requiredExtensions: r.seq0_64k_u16(),
     })),
     submitSharesSuccess: (p: Buffer): SubmitSharesSuccess => decodeWith(p, r => ({
         channelId: r.u32(), lastSequenceNumber: r.u32(), newSubmitsAcceptedCount: r.u32(), newSharesSum: r.u64(),

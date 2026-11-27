@@ -80,6 +80,10 @@ export function sv2Difficulty(wanted: number, lower: number, upper: number): num
     return Math.min(Math.max(nearest, lo), hi);
 }
 
+// SRI's translator in aggregated mode opens one channel for a whole farm as
+// "<address>.translator-proxy": no single worker name can stand for it.
+export const AGGREGATED_PROXY_WORKER = 'translator-proxy';
+
 /** What a channel needs from its connection. */
 export interface ISv2ChannelLink {
     /** Encrypts and writes one plaintext frame. False if the connection is gone. */
@@ -107,6 +111,10 @@ export class Sv2Channel extends MinerSession {
     private nextSv2JobId = 1;
     private readonly sv2ToPoolJob = new Map<number, string>();
     private refreshTimer: NodeJS.Timeout = null;
+    // Extension 0x0002: the worker name a proxy sends with each share. The first
+    // one names the channel (if no share has been recorded yet) and then stays.
+    private tlvWorker: string = null;
+    private tlvWorkerConflictWarned = false;
     private refreshTooFastWarned = false;
     private nominalHashRate = 0;
     // Pool job ids sent as future jobs: SetTarget applies to these too (spec 5.3.21).
@@ -328,7 +336,33 @@ export class Sv2Channel extends MinerSession {
     }
 
     /** SubmitSharesStandard / SubmitSharesExtended for this channel. */
-    public async submit(m: SubmitSharesStandard | SubmitSharesExtended, extended: boolean) {
+    /**
+     * A worker name from a share's 0x0002 TLV (a proxy passing on its miner's own
+     * worker name). Same parsing as V1's "address.worker": up to the first dot.
+     * It names the channel only before the miner's record exists, so a channel
+     * keeps one name for its life; a different name later is logged, not used.
+     */
+    public applyTlvWorkerName(name: string) {
+        const worker = name.split('.')[0];
+        if (worker.length === 0 || worker === this.address || this.worker === AGGREGATED_PROXY_WORKER) return;
+        if (this.tlvWorker != null) {
+            if (worker !== this.tlvWorker && !this.tlvWorkerConflictWarned) {
+                this.tlvWorkerConflictWarned = true;
+                const clean = (x: string) => x.replace(/[^\x21-\x7e]/g, '?').slice(0, 40);
+                console.warn(`SV2: channel ${this.address}.${clean(this.worker)} sent shares for another worker "${clean(worker)}"; `
+                    + `they count as ${clean(this.worker)} (one worker per channel: use a non-aggregated proxy)`);
+            }
+            return;
+        }
+        this.tlvWorker = worker;
+        if (this.entity != null || worker === this.worker) return;
+        const clean = (x: string) => x.replace(/[^\x21-\x7e]/g, '?').slice(0, 40);
+        console.log(`SV2 worker name: ${this.address}.${clean(this.worker)} is ${this.address}.${clean(worker)} (from the proxy) session=${this.extraNonceAndSessionId}`);
+        this.worker = worker;
+    }
+
+    public async submit(m: SubmitSharesStandard | SubmitSharesExtended, extended: boolean, tlvWorkerName: string | null = null) {
+        if (tlvWorkerName != null) this.applyTlvWorkerName(tlvWorkerName);
         const reject = (code: string) => this.link.send(enc.submitSharesError({ channelId: this.channelId, sequenceNumber: m.sequenceNumber, errorCode: code }));
         if (extended !== (this.type === 'extended')) {
             this.logReject('wrong-submit-type');

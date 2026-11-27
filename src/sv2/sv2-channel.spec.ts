@@ -24,7 +24,8 @@ import { StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { FoundBlocksService } from '../splash/found-blocks';
 import { dec, difficultyToTarget, MSG, targetToDifficulty } from './codec';
 import { TRUE_DIFF_ONE } from '../models/MinerSession';
-import { STANDARD_REFRESH_MAX_SECONDS, standardRefreshSeconds, SV2_MAX_DIFFICULTY, Sv2Channel, Sv2ChannelType, sv2Difficulty } from './sv2-channel';
+import { ClientService as ClientServiceType } from '../ORM/client/client.service';
+import { AGGREGATED_PROXY_WORKER, STANDARD_REFRESH_MAX_SECONDS, standardRefreshSeconds, SV2_MAX_DIFFICULTY, Sv2Channel, Sv2ChannelType, sv2Difficulty } from './sv2-channel';
 
 jest.mock('../services/bitcoin-rpc.service');
 
@@ -97,10 +98,10 @@ describe('Sv2Channel: vardiff mid-job', () => {
         return channel;
     }
 
-    async function openChannel(type: Sv2ChannelType, startDifficulty: number, template?: any) {
+    async function openChannel(type: Sv2ChannelType, startDifficulty: number, template?: any, worker = 'bitaxe') {
         makeChannel(type, template);
         // nominal hash rate for one share per 10 s at startDifficulty.
-        const target = channel.open(ADDRESS, 'bitaxe', 'bitaxe/BM1370 (SV2)', startDifficulty * 2 ** 32 / 10, Buffer.alloc(32, 0xff));
+        const target = channel.open(ADDRESS, worker, 'bitaxe/BM1370 (SV2)', startDifficulty * 2 ** 32 / 10, Buffer.alloc(32, 0xff));
         expect(targetToDifficulty(target)).toBeCloseTo(startDifficulty, 6);
         channel.start();
         await waitFor(() => sent.some(s => s.type === MSG.SetNewPrevHash));
@@ -433,6 +434,68 @@ describe('Sv2Channel: vardiff mid-job', () => {
             } finally {
                 jest.useRealTimers();
             }
+        });
+    });
+
+    describe('extension 0x0002: a proxy names each channel after its miner', () => {
+        // SRI's translator (non-aggregated) opens one channel per miner as
+        // "<address>.minerN" and, once 0x0002 is negotiated, sends the miner's
+        // own worker name with every share.
+        async function extShare(worker: string | null, difficulty = 2000) {
+            const first = dec.newExtendedMiningJob(sent.find(x => x.type === MSG.NewExtendedMiningJob).payload);
+            jest.spyOn(channel as any, 'calculateDifficulty').mockReturnValueOnce({ submissionDifficulty: difficulty, submissionHash: '' });
+            const before = sent.length;
+            await channel.submit({ channelId: 1, sequenceNumber: nonce, jobId: first.jobId, nonce: nonce++, ntime: prevHashNtime(), version: first.version, extranonce: Buffer.alloc(8, nonce) }, true, worker);
+            return sent.slice(before).find(x => x.type === MSG.SubmitSharesSuccess || x.type === MSG.SubmitSharesError).type === MSG.SubmitSharesSuccess;
+        }
+        const recordedWorkers = () => shareWindowService.recordShare.mock.calls.map(c => c[3]);
+        const insertedNames = () => (moduleRef.get(ClientServiceType).insert as jest.Mock).mock.calls.map(c => c[0].clientName);
+        beforeEach(() => {
+            const insert = moduleRef.get(ClientServiceType).insert as jest.Mock;
+            if (jest.isMockFunction(insert)) insert.mockClear();
+        });
+
+        it('the first share\'s worker name replaces minerN everywhere: credit, the miner\'s record, the connection log', async () => {
+            await openChannel('extended', 1024, undefined, 'miner1');
+            expect(await extShare('bitaxe-hex')).toBe(true);
+            expect(await extShare('bitaxe-hex')).toBe(true);
+            expect(recordedWorkers()).toEqual(['bitaxe-hex', 'bitaxe-hex']);
+            expect(insertedNames()).toEqual(['bitaxe-hex']);
+            expect(channel.connectionSummary('192.0.2.1', false)).toContain(`worker=${ADDRESS}.bitaxe-hex `);
+            expect(logSpies[0].mock.calls.some(c => `${c[0]}`.includes(`${ADDRESS}.miner1 is ${ADDRESS}.bitaxe-hex (from the proxy)`))).toBe(true);
+        });
+
+        it('a channel keeps one name: a different later name is logged once and counted as the first', async () => {
+            await openChannel('extended', 1024, undefined, 'miner1');
+            expect(await extShare('left-rig')).toBe(true);
+            expect(await extShare('right-rig')).toBe(true);
+            expect(await extShare('third-rig')).toBe(true);
+            expect(recordedWorkers()).toEqual(['left-rig', 'left-rig', 'left-rig']);
+            expect(logSpies[1].mock.calls.filter(c => `${c[0]}`.includes('sent shares for another worker'))).toHaveLength(1);
+        });
+
+        it('no renaming once a share is recorded under the channel\'s own name', async () => {
+            await openChannel('extended', 1024, undefined, 'miner1');
+            expect(await extShare(null)).toBe(true);
+            expect(await extShare('bitaxe-hex')).toBe(true);
+            expect(recordedWorkers()).toEqual(['miner1', 'miner1']);
+            expect(insertedNames()).toEqual(['miner1']);
+        });
+
+        it('same parsing as V1 "address.worker": up to the first dot; a bare address or empty name is ignored', async () => {
+            await openChannel('extended', 1024, undefined, 'miner1');
+            channel.applyTlvWorkerName(ADDRESS);
+            channel.applyTlvWorkerName('.x');
+            expect(await extShare('rig.left')).toBe(true);
+            expect(recordedWorkers()).toEqual(['rig']);
+        });
+
+        it('an aggregated proxy channel (one channel, many miners) keeps its own name', async () => {
+            await openChannel('extended', 1024, undefined, AGGREGATED_PROXY_WORKER);
+            expect(await extShare('bitaxe-hex')).toBe(true);
+            expect(await extShare('s19-left')).toBe(true);
+            expect(recordedWorkers()).toEqual([AGGREGATED_PROXY_WORKER, AGGREGATED_PROXY_WORKER]);
+            expect(logSpies[1].mock.calls.filter(c => `${c[0]}`.includes('another worker'))).toHaveLength(0);
         });
     });
 });

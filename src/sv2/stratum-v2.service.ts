@@ -15,9 +15,29 @@ import { PayoutService } from '../splash/payout.service';
 import { IAuthorityKey, loadAuthorityFile } from './authority';
 import { ellswiftKeygen, IEllSwiftKeypair } from './ellswift';
 import { signCertificate } from './noise';
-import { Sv2Connection } from './sv2-connection';
+import { DEFAULT_MAX_CHANNELS_PER_CONNECTION, IChannelBudget, Sv2Connection } from './sv2-connection';
 
 const DEFAULT_CERT_VALIDITY_SECONDS = 24 * 60 * 60;
+// Channels one IP may hold over all its connections (a proxy for a farm is one IP).
+const DEFAULT_MAX_CHANNELS_PER_IP = 1024;
+const CHANNEL_LIMIT_CEILING = 65536;
+
+/** Open channels per IP. */
+export class ChannelBudget implements IChannelBudget {
+    private readonly open = new Map<string, number>();
+    constructor(private readonly perIp: number) { }
+    take(ip: string): boolean {
+        const n = this.open.get(ip) ?? 0;
+        if (n >= this.perIp) return false;
+        this.open.set(ip, n + 1);
+        return true;
+    }
+    give(ip: string): void {
+        const n = this.open.get(ip) ?? 0;
+        if (n <= 1) this.open.delete(ip); else this.open.set(ip, n - 1);
+    }
+    count(ip: string): number { return this.open.get(ip) ?? 0; }
+}
 // Certificates start an hour back, for miners whose clocks run behind.
 const CERT_BACKDATE_SECONDS = 60 * 60;
 
@@ -85,6 +105,15 @@ export class StratumV2Service implements OnModuleInit {
         return signCertificate(this.authority.secret, this.staticKey.publicKey, now - CERT_BACKDATE_SECONDS, now + validity);
     }
 
+    /** A whole number from 1 to CHANNEL_LIMIT_CEILING, else the default. */
+    private limit(key: string, fallback: number): number {
+        const raw = this.configService.get(key);
+        const n = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw);
+        if (Number.isInteger(n) && n >= 1 && n <= CHANNEL_LIMIT_CEILING) return n;
+        if (raw != null && `${raw}`.trim() !== '') console.warn(`Ignoring invalid ${key}=${raw}`);
+        return fallback;
+    }
+
     private flag(key: string, fallback: boolean): boolean {
         const raw = this.configService.get(key);
         if (raw == null || `${raw}`.trim() === '') return fallback;
@@ -96,8 +125,13 @@ export class StratumV2Service implements OnModuleInit {
         const guard = new IpGuard(ipGuardOptions(key => this.configService.get(key)));
         console.log(`Stratum V2 ${guard.describe()}`);
         const authTimeout = Number(this.configService.get('SPLASH_AUTH_TIMEOUT_SECONDS'));
+        const perConnection = this.limit('SV2_MAX_CHANNELS_PER_CONNECTION', DEFAULT_MAX_CHANNELS_PER_CONNECTION);
+        const perIp = this.limit('SV2_MAX_CHANNELS_PER_IP', DEFAULT_MAX_CHANNELS_PER_IP);
+        console.log(`Stratum V2 channels: at most ${perConnection} per connection, ${perIp} per IP`);
         const options = {
             staticKey: this.staticKey,
+            maxChannelsPerConnection: perConnection,
+            channelBudget: new ChannelBudget(perIp),
             certificate: () => this.certificate(),
             logShares: this.flag('SV2_LOG_SHARES', this.configService.get('NETWORK') !== 'mainnet'),
             connLog: this.flag('SPLASH_CONN_LOG', false),

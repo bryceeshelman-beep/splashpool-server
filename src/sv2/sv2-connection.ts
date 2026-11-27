@@ -14,7 +14,7 @@ import { StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { FoundBlocksService } from '../splash/found-blocks';
 import { IConnectionReporter } from '../splash/ip-guard';
 import { PayoutService } from '../splash/payout.service';
-import { dec, enc, MSG, Sv2DecodeError } from './codec';
+import { CHANNEL_MSG_BIT, dec, enc, EXT, EXT_NEGOTIATION_MSG, MAX_TLV_WORKER_IDENTITY_BYTES, MSG, Sv2DecodeError, WORKER_IDENTITY_FIELD } from './codec';
 import { IDecryptedFrame, NoiseResponder, Sv2NoiseError } from './noise';
 import { Sv2Channel, Sv2ChannelType } from './sv2-channel';
 import { IEllSwiftKeypair } from './ellswift';
@@ -22,7 +22,10 @@ import { IEllSwiftKeypair } from './ellswift';
 // Everything a miner sends is small; jobs only go the other way.
 const MAX_INBOUND_PAYLOAD = 4096;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
-const MAX_CHANNELS = 8;
+// Channels on one connection (a proxy puts each miner on its own channel).
+export const DEFAULT_MAX_CHANNELS_PER_CONNECTION = 256;
+// Extensions this pool supports (sv2-spec extensions/): worker-specific hashrate tracking.
+export const SUPPORTED_EXTENSIONS: readonly number[] = [EXT.WorkerHashrateTracking];
 // Unknown or unusable messages in a row, with no accepted share between them.
 const MAX_INVALID_MESSAGES = 10;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
@@ -43,8 +46,16 @@ export interface ISv2Services {
     payoutService: PayoutService;
 }
 
+/** Channels per IP, over all of that IP's connections. */
+export interface IChannelBudget {
+    take(ip: string): boolean;
+    give(ip: string): void;
+}
+
 export interface ISv2ConnectionOptions {
     staticKey: IEllSwiftKeypair;
+    maxChannelsPerConnection?: number;
+    channelBudget?: IChannelBudget;
     /** Signs a fresh certificate for this connection. */
     certificate: () => Buffer;
     logShares: boolean;
@@ -60,8 +71,9 @@ export function sv2UserAgent(vendor: string, hardwareVersion: string, firmware: 
 }
 
 /**
- * One Stratum V2 connection: the Noise handshake, SetupConnection, and up to
- * eight mining channels (each a separate miner identity).
+ * One Stratum V2 connection: the Noise handshake, SetupConnection, extension
+ * negotiation, and mining channels (each a separate miner identity), up to
+ * maxChannelsPerConnection and the IP's channel budget.
  */
 export class Sv2Connection {
     private readonly noise: NoiseResponder;
@@ -77,6 +89,9 @@ export class Sv2Connection {
     private handshakeTimer: NodeJS.Timeout;
     private authTimer: NodeJS.Timeout = null;
     private readonly connectedAt = Date.now();
+    // Extension negotiation (0x0001): answered once, before any channel.
+    private extensionsNegotiated = false;
+    private workerTracking = false;
 
     constructor(
         private readonly socket: Socket,
@@ -160,12 +175,22 @@ export class Sv2Connection {
 
     private async handleFrame(f: IDecryptedFrame) {
         const t = f.header.msgType;
+        const extension = f.header.extensionType & ~CHANNEL_MSG_BIT;
         if (this.state === 'setup') {
-            if (t !== MSG.SetupConnection) {
+            if (t !== MSG.SetupConnection || extension !== 0) {
                 this.closeAsJunk('no-setup');
                 return;
             }
             await this.onSetupConnection(dec.setupConnection(f.payload));
+            return;
+        }
+        if (extension === EXT.Negotiation && t === EXT_NEGOTIATION_MSG.RequestExtensions) {
+            await this.onRequestExtensions(dec.requestExtensions(f.payload));
+            return;
+        }
+        if (extension !== 0) {
+            // Any other extension's own messages: not offered here.
+            this.noteInvalid();
             return;
         }
         switch (t) {
@@ -181,8 +206,10 @@ export class Sv2Connection {
                 break;
             }
             case MSG.SubmitSharesExtended: {
-                const m = dec.submitSharesExtended(f.payload);
-                await this.onSubmit(m.channelId, m.sequenceNumber, ch => ch.submit(m, true));
+                // TLV fields may follow (sv2-spec 3.4.3). Unnegotiated ones are ignored.
+                const { share: m, tlvs } = dec.submitSharesExtendedWithTlvs(f.payload);
+                const workerName = this.workerTracking ? this.tlvWorkerName(tlvs) : null;
+                await this.onSubmit(m.channelId, m.sequenceNumber, ch => ch.submit(m, true, workerName));
                 break;
             }
             case MSG.UpdateChannel: {
@@ -201,6 +228,7 @@ export class Sv2Connection {
                 const ch = this.channels.get(m.channelId);
                 if (ch != null) {
                     this.channels.delete(m.channelId);
+                    this.options.channelBudget?.give(this.ip);
                     if (this.options.connLog) console.log(ch.connectionSummary(this.ip, false).replace('reason=client-closed', 'reason=close-channel'));
                     await ch.close();
                 }
@@ -211,6 +239,37 @@ export class Sv2Connection {
                 // SetupConnection, or anything else: not offered here.
                 this.noteInvalid();
         }
+    }
+
+    /** Extension 0x0002's worker name on a share, if it has one. */
+    private tlvWorkerName(tlvs: { extensionType: number, fieldType: number, value: Buffer }[]): string | null {
+        const t = tlvs.find(x => x.extensionType === EXT.WorkerHashrateTracking && x.fieldType === WORKER_IDENTITY_FIELD);
+        if (t == null) return null;
+        if (t.value.length === 0 || t.value.length > MAX_TLV_WORKER_IDENTITY_BYTES) {
+            throw new Sv2DecodeError(`worker identity TLV of ${t.value.length} bytes`);
+        }
+        const name = t.value.toString('utf8');
+        if (!Buffer.from(name, 'utf8').equals(t.value)) throw new Sv2DecodeError('worker identity TLV is not valid UTF-8');
+        return name;
+    }
+
+    /** RequestExtensions (extension 0x0001): once, right after SetupConnection, before any channel. */
+    private async onRequestExtensions(m: ReturnType<typeof dec.requestExtensions>) {
+        if (this.extensionsNegotiated || this.channels.size > 0) {
+            this.noteInvalid();
+            return;
+        }
+        this.extensionsNegotiated = true;
+        const requested = [...new Set(m.requestedExtensions)];
+        const supported = requested.filter(e => SUPPORTED_EXTENSIONS.includes(e));
+        if (supported.length === 0) {
+            // None supported (or none asked for): an Error, and the client carries on without (spec 0x0001, 4.1).
+            await this.send(enc.requestExtensionsError({ requestId: m.requestId, unsupportedExtensions: requested, requiredExtensions: [] }));
+            return;
+        }
+        // Only the supported ones are confirmed; the client must not use the others.
+        await this.send(enc.requestExtensionsSuccess({ requestId: m.requestId, supportedExtensions: supported }));
+        this.workerTracking = supported.includes(EXT.WorkerHashrateTracking);
     }
 
     private async onSetupConnection(m: ReturnType<typeof dec.setupConnection>) {
@@ -253,7 +312,7 @@ export class Sv2Connection {
             await this.send(enc.openMiningChannelError({ requestId: m.requestId, errorCode }));
             this.noteInvalid();
         };
-        if (this.channels.size >= MAX_CHANNELS) {
+        if (this.channels.size >= (this.options.maxChannelsPerConnection ?? DEFAULT_MAX_CHANNELS_PER_CONNECTION)) {
             return fail('max-channels-reached');
         }
         // The same address.worker parsing and address check as mining.authorize.
@@ -266,6 +325,9 @@ export class Sv2Connection {
         if (type === 'extended' && (m.minExtranonceSize ?? 0) > 8) {
             return fail('min-extranonce-size-too-large');
         }
+        if (this.options.channelBudget != null && !this.options.channelBudget.take(this.ip)) {
+            return fail('max-channels-reached');
+        }
         const id = this.nextChannelId++;
         const ch = this.newChannel(id, type);
         const target = ch.open(auth.address, auth.worker, this.userAgent, m.nominalHashRate, m.maxTarget);
@@ -273,7 +335,10 @@ export class Sv2Connection {
         const ok = type === 'standard'
             ? await this.send(enc.openStandardMiningChannelSuccess({ requestId: m.requestId, channelId: id, target, extranoncePrefix: prefix, groupChannelId: 0 }))
             : await this.send(enc.openExtendedMiningChannelSuccess({ requestId: m.requestId, channelId: id, target, extranonceSize: ch.extranonceSize, extranoncePrefix: prefix, groupChannelId: 0 }));
-        if (!ok) return;
+        if (!ok) {
+            this.options.channelBudget?.give(this.ip);
+            return;
+        }
         this.channels.set(id, ch);
         console.log(`SV2 channel open: ip=${this.ip} worker=${auth.address}.${auth.worker} type=${type} id=${id} diff=${ch.difficulty} agent=${this.userAgent} session=${ch.extraNonceAndSessionId}`);
         ch.start();
@@ -321,6 +386,7 @@ export class Sv2Connection {
             return;
         }
         for (const ch of this.channels.values()) {
+            this.options.channelBudget?.give(this.ip);
             if (reason != null) ch.setCloseReason(reason);
             console.log(ch.connectionSummary(this.ip, hadError));
             // When stopping, skip it: startup clears the client table anyway.
