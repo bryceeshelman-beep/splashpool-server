@@ -437,6 +437,22 @@ describe('Sv2Channel: vardiff mid-job', () => {
         });
     });
 
+    it('a template and a vardiff refresh at the same moment: one future job and one SetNewPrevHash, then a normal job', async () => {
+        const spy = jest.spyOn(Sv2Channel.prototype as any, 'sendNewMiningJobNow');
+        await openChannel('extended', 1024);
+        const template = spy.mock.calls[0][0];
+        spy.mockRestore();
+        // As on a fresh channel whose first job is still being sent.
+        (channel as any).lastPrevHash = null;
+        sent = [];
+        await Promise.all([(channel as any).sendNewMiningJob(template), (channel as any).sendNewMiningJob(template)]);
+        expect(sent.map(x => x.type)).toEqual([MSG.NewExtendedMiningJob, MSG.SetNewPrevHash, MSG.NewExtendedMiningJob]);
+        const [future, , next] = [sent[0], sent[1], sent[2]].map(x => x.type === MSG.NewExtendedMiningJob ? dec.newExtendedMiningJob(x.payload) : null);
+        expect(future.minNtime).toBeNull();
+        expect(dec.setNewPrevHash(sent[1].payload).jobId).toBe(future.jobId);
+        expect(next.minNtime).not.toBeNull();
+    });
+
     describe('extension 0x0002: a proxy names each channel after its miner', () => {
         // SRI's translator (non-aggregated) opens one channel per miner as
         // "<address>.minerN" and, once 0x0002 is negotiated, sends the miner's

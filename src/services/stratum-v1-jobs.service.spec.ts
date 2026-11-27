@@ -51,6 +51,19 @@ describe('StratumV1JobsService', () => {
         expect(service.getJobTemplateById('1')).toBe(jobTemplate);
     });
 
+    it('a miner arriving after the stream went idle gets the current work at once, even if unchanged', async () => {
+        // Last subscriber leaves (refCount stops the stream), then a new miner subscribes
+        // with the same template still current (a quiet testnet4 mempool).
+        const first = await firstValueFrom(service.newMiningJob$);
+        const got: any[] = [];
+        const sub = service.newMiningJob$.subscribe(t => got.push(t));
+        for (let i = 0; i < 20 && got.length === 0; i++) await Promise.resolve();
+        sub.unsubscribe();
+        expect(got).toHaveLength(1);
+        expect(got[0].blockData.clearJobs).toBe(false);
+        expect(got[0].block.prevHash).toEqual(first.block.prevHash);
+    });
+
     it('should clear jobs when the block height changes', async () => {
         const firstTemplate = await firstValueFrom(service.newMiningJob$);
         service.addJob({ jobId: 'old-job', creation: Date.now() } as any);
@@ -101,8 +114,9 @@ describe('StratumV1JobsService', () => {
         subscription.unsubscribe();
         const jobTemplate = emissions[emissions.length - 1];
 
+        // The new subscriber first gets the current work (2), then the changed work (3).
+        expect(emissions.map(t => t.blockData.id)).toEqual(['2', '3']);
         expect(jobTemplate.blockData.clearJobs).toBe(false);
-        expect(jobTemplate.blockData.id).toBe('2');
         expect(service.getJobTemplateById(jobTemplate.blockData.id)).toBe(jobTemplate);
     });
 

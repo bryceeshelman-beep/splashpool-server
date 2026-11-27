@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import * as bitcoinjs from 'bitcoinjs-lib';
 import * as merkle from 'merkle-lib';
 import * as merkleProof from 'merkle-lib/proof';
-import { combineLatest, delay, filter, from, interval, map, Observable, shareReplay, startWith, switchMap, tap } from 'rxjs';
+import { combineLatest, defer, delay, filter, from, interval, map, Observable, shareReplay, startWith, switchMap, tap } from 'rxjs';
 
 import { MiningJob } from '../models/MiningJob';
 import { BitcoinRpcService } from './bitcoin-rpc.service';
@@ -47,7 +47,13 @@ export class StratumV1JobsService {
             ? interval(60000).pipe(delay(this.delay), startWith(-1))
             : interval(60000).pipe(startWith(-1));
 
-        this.newMiningJob$ = combineLatest([this.bitcoinRpcService.newBlock$, refreshInterval$]).pipe(
+        // The stream stops when nobody is subscribed (refCount) and starts again for
+        // the next miner. Its first template must then go out even if it is the same
+        // work as before the stop: forget the last signature on every (re)start.
+        this.newMiningJob$ = defer(() => {
+            this.lastWorkSignature = undefined;
+            return combineLatest([this.bitcoinRpcService.newBlock$, refreshInterval$]);
+        }).pipe(
             switchMap(([miningInfo, interval]) => {
                 return from(this.bitcoinRpcService.getBlockTemplate(miningInfo.blocks)).pipe(map((blockTemplate) => {
                     return {

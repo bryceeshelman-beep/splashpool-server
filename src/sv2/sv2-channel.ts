@@ -233,7 +233,19 @@ export class Sv2Channel extends MinerSession {
         await this.sendRefreshedJob();
     }
 
-    protected async sendNewMiningJob(jobTemplate: IJobTemplate) {
+    // Job sends run one at a time: a template and a vardiff refresh at the same
+    // moment must not both see a new prevhash (two future jobs, two SetNewPrevHash;
+    // SRI's translator drops the first future job on the first SetNewPrevHash and
+    // fails on the second).
+    private jobSendQueue: Promise<void> = Promise.resolve();
+
+    protected sendNewMiningJob(jobTemplate: IJobTemplate): Promise<void> {
+        const run = this.jobSendQueue.then(() => this.sendNewMiningJobNow(jobTemplate));
+        this.jobSendQueue = run.catch(() => undefined);
+        return run;
+    }
+
+    private async sendNewMiningJobNow(jobTemplate: IJobTemplate) {
         const job = this.buildJob(jobTemplate);
         if (job == null) {
             return;
