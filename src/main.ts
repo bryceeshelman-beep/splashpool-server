@@ -10,6 +10,7 @@ import { AppModule } from './app.module';
 import { validatorContainer } from './models/validators/validator-container';
 import { ShareWindowService } from './ORM/share-window/share-window.service';
 import { StratumV1Service } from './services/stratum-v1.service';
+import { StratumV2Service } from './sv2/stratum-v2.service';
 import { FoundBlocksService } from './splash/found-blocks';
 import { shutdownHandler } from './splash/shutdown';
 import { RoundService } from './splash/site/round.service';
@@ -45,7 +46,10 @@ async function bootstrap() {
   );
 
   const stop = shutdownHandler(
-    () => app.get(StratumV1Service, { strict: false }).stopIntake(),
+    () => {
+      app.get(StratumV1Service, { strict: false }).stopIntake();
+      app.get(StratumV2Service, { strict: false }).stopIntake();
+    },
     [
       () => app.get(FoundBlocksService, { strict: false }).stop(),
       () => app.get(ShareWindowService, { strict: false }).onApplicationShutdown(),

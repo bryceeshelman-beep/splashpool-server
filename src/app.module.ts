@@ -23,6 +23,7 @@ import { DiscordService } from './services/discord.service';
 import { NotificationService } from './services/notification.service';
 import { StratumV1JobsService } from './services/stratum-v1-jobs.service';
 import { StratumV1Service } from './services/stratum-v1.service';
+import { StratumV2Service } from './sv2/stratum-v2.service';
 import { TelegramService } from './services/telegram.service';
 import { ExternalSharesService } from './services/external-shares.service';
 import { ExternalShareController } from './controllers/external-share/external-share.controller';
@@ -79,6 +80,7 @@ const ORMModules = [
         DiscordService,
         AppService,
         StratumV1Service,
+        StratumV2Service,
         TelegramService,
         BitcoinRpcService,
         NotificationService,
