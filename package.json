@@ -32,6 +32,7 @@
     "@nestjs/platform-fastify": "^11.1.19",
     "@nestjs/schedule": "^6.1.3",
     "@nestjs/typeorm": "^11.0.1",
+    "@scure/btc-signer": "2.4.1",
     "axios": "^1.16.0",
     "bitcoin-address-validation": "^2.2.3",
     "bitcoinjs-lib": "^6.1.7",
@@ -41,9 +42,9 @@
     "class-validator": "^0.14.4",
     "discord.js": "^14.26.4",
     "merkle-lib": "^2.0.10",
-    "sqlite3": "^5.1.6",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
+    "sqlite3": "^5.1.6",
     "tiny-secp256k1": "^2.2.4",
     "typeorm": "^0.3.28",
     "zeromq": "6.0.0-beta.19"
@@ -87,12 +88,20 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/../tsconfig.spec.json"
+        }
+      ]
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(@scure|@noble|micro-packed)/)"
+    ]
   }
 }
