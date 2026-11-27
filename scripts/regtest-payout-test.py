@@ -19,13 +19,17 @@ Cases (A-D share one window; E-H start on a fresh one):
   G  a newcomer joins a pool with shares and finds a block in its first second
   H  shares land at the same moment the block is found (burst around the submit)
   I  a block with real transaction fees: fee and split use subsidy + fees
+  J  Stratum V2 (fresh 50 BTC chain): an SV2 standard-channel newcomer, a V1
+     newcomer and an SV2 extended-channel newcomer find blocks in turn; each
+     coinbase follows the rules, and SV2 and V1 shares earn the same split
 """
 import calendar, hashlib, json, os, shutil, socket, struct, subprocess, sys, time, urllib.request, secrets
 
 WORK = os.path.abspath(sys.argv[1])
 POOL_SRC = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(__file__), '..'))
 BIN = os.environ.get('BITCOIN_BIN', '')
-RPC, ZMQ, STRATUM, API = 28543, 28545, 23435, 23436
+RPC, ZMQ, STRATUM, API, SV2 = 28543, 28545, 23435, 23436, 23437
+NODE_DIR = f'{WORK}/node'
 PW = secrets.token_hex(12)
 fails = 0
 
@@ -35,19 +39,19 @@ def ok(name, cond, extra=''):
     print('PASS' if cond else 'FAIL', name, extra, flush=True)
 
 def cli(*a):
-    return subprocess.check_output([os.path.join(BIN, 'bitcoin-cli'), '-regtest', f'-datadir={WORK}/node', f'-rpcport={RPC}',
+    return subprocess.check_output([os.path.join(BIN, 'bitcoin-cli'), '-regtest', f'-datadir={NODE_DIR}', f'-rpcport={RPC}',
                                     '-rpcuser=t', f'-rpcpassword={PW}', *a], text=True).strip()
 
 dsha = lambda b: hashlib.sha256(hashlib.sha256(b).digest()).digest()
 
 class Miner:
-    def __init__(self, addr, agent='payout-test/1'):
+    def __init__(self, addr, agent='payout-test/1', suggest=1e-10):
         self.addr, self.s, self.b, self.q, self.closed, self.i = addr, socket.create_connection(('127.0.0.1', STRATUM)), b'', [], False, 10
         self.send('mining.subscribe', [agent], 1)
         self.en1 = self.wait(lambda m: m.get('id') == 1)['result'][1]
         # Below regtest's block difficulty (~4.7e-10), so non-block shares exist,
         # and above 0, so each share is credited work.
-        self.send('mining.suggest_difficulty', [1e-10], 2)
+        self.send('mining.suggest_difficulty', [suggest], 2)
         self.send('mining.authorize', [addr + '.w', 'x'], 3)
         assert self.wait(lambda m: m.get('id') == 3)['result'], 'login refused'
         self.n2 = 0
@@ -167,7 +171,7 @@ def expected_payouts(reward, finder, fee_addr, window, bonus_sats, fee_ppm, min_
 def api(path):
     return json.load(urllib.request.urlopen(f'http://127.0.0.1:{API}{path}', timeout=10))
 
-def write_env(fee_addr, bonus=112_500_000, min_payout=10_000):
+def write_env(fee_addr, bonus=112_500_000, min_payout=10_000, sv2=False):
     open(f'{WORK}/pool/.env', 'w').write(f'''BITCOIN_RPC_URL=http://127.0.0.1
 BITCOIN_RPC_USER=t
 BITCOIN_RPC_PASSWORD={PW}
@@ -186,7 +190,10 @@ SPLASH_FEE_PPM=1250
 SPLASH_BONUS_SATS={bonus}
 SPLASH_MIN_PAYOUT_SATS={min_payout}
 SPLASH_FOUND_BLOCKS_DIR={WORK}/found-blocks
-''')
+''' + (f'''SV2_ENABLED=true
+SV2_PORT={SV2}
+SV2_AUTHORITY_KEY_FILE={WORK}/sv2-authority.key
+''' if sv2 else ''))
 
 pool = None
 def start_pool():
@@ -230,6 +237,10 @@ def mine_case(name, finder, miners, fee_addr, bonus, min_payout, burn, job=None,
     before = int(cli('getblockcount'))
     submit_block = lambda: finder.submit(job, en2, t, nonce)
     res = burst(submit_block) if burst else submit_block()
+    return check_block(name, finder.addr, fee_addr, bonus, min_payout, window, res, h, before)
+
+def check_block(name, finder_addr, fee_addr, bonus, min_payout, window, res, h, before):
+    """Waits for the block `h` and checks its coinbase against the payout rules."""
     for _ in range(40):
         if int(cli('getblockcount')) > before:
             break
@@ -249,7 +260,7 @@ def mine_case(name, finder, miners, fee_addr, bonus, min_payout, burn, job=None,
     reward = sum(got.values())
     subsidy = json.loads(cli('getblockstats', str(blk['height']), '["subsidy","totalfee"]'))
     ok(f'{name}: outputs sum to subsidy + fees', reward == subsidy['subsidy'] + subsidy['totalfee'], f'{reward} sats')
-    exp, parts = expected_payouts(reward, finder.addr, fee_addr, window, bonus, 1250, min_payout)
+    exp, parts = expected_payouts(reward, finder_addr, fee_addr, window, bonus, 1250, min_payout)
     ok(f'{name}: coinbase matches the payout rules exactly', got == exp,
        '' if got == exp else f'\n   got {json.dumps(got)}\n   exp {json.dumps(exp)}')
     ok(f'{name}: tag in coinbase', b'-=+SplashPool+=-' in bytes.fromhex(cb['vin'][0]['coinbase']))
@@ -263,14 +274,14 @@ try:
     os.makedirs(f'{WORK}/node'); os.makedirs(f'{WORK}/pool/DB')
     shutil.copytree(f'{POOL_SRC}/dist', f'{WORK}/pool/dist')
     os.symlink(os.path.realpath(f'{POOL_SRC}/node_modules'), f'{WORK}/pool/node_modules')
-    node = subprocess.Popen([os.path.join(BIN, 'bitcoind'), '-regtest', f'-datadir={WORK}/node', f'-rpcport={RPC}',
+    node = subprocess.Popen([os.path.join(BIN, 'bitcoind'), '-regtest', f'-datadir={NODE_DIR}', f'-rpcport={RPC}',
                              '-rpcbind=127.0.0.1', '-rpcallowip=127.0.0.1', '-rpcuser=t', f'-rpcpassword={PW}',
                              '-listen=0', '-dnsseed=0', '-connect=0', f'-zmqpubrawblock=tcp://127.0.0.1:{ZMQ}',
                              '-printtoconsole=0', '-fallbackfee=0.0001'])
     cli('-rpcwait', 'getblockcount')
     js = ("const b=require('bitcoinjs-lib');const n=b.networks.regtest;"
-          "console.log(JSON.stringify([1,2,3,4,5,6,7].map(j=>b.payments.p2wpkh({hash:b.crypto.sha256(Buffer.from('payout'+j)).subarray(0,20),network:n}).address)))")
-    fee_addr, alice, bob, carol, burn, erin, frank = json.loads(subprocess.check_output(['node', '-e', js], cwd=POOL_SRC))
+          "console.log(JSON.stringify([1,2,3,4,5,6,7,8,9,10].map(j=>b.payments.p2wpkh({hash:b.crypto.sha256(Buffer.from('payout'+j)).subarray(0,20),network:n}).address)))")
+    fee_addr, alice, bob, carol, burn, erin, frank, sam, vic, xena = json.loads(subprocess.check_output(['node', '-e', js], cwd=POOL_SRC))
     cli('generatetoaddress', '20', burn)  # past the BIP34 1-byte heights; reward 50 BTC
 
     write_env(fee_addr)
@@ -429,6 +440,90 @@ try:
        and fee_i > (stats['subsidy'] - E_BONUS) * 1250 // 1_000_000, f'fee={fee_i}')
     ok('I: miners get exactly bonus + the split of (reward - bonus - fee)',
        got[erin] + got[frank] == E_BONUS + parts['pool'] == reward - fee_i and got[erin] > E_BONUS and got[frank] > 0)
+
+    # J: Stratum V2, on a fresh chain (50 BTC reward, so the 1.125 BTC Splash
+    # Bonus and the fee both show). SV2 channel difficulty is at least 1, far
+    # above regtest's block difficulty, so every accepted SV2 share is a block,
+    # credited at the block difficulty, as V1 credits a share (min of its job
+    # difficulty and the block's). V1 newcomer Vic suggests difficulty 1, so his
+    # block share is credited exactly like an SV2 one.
+    stop_pool()
+    cli('stop'); node.wait()
+    NODE_DIR = f'{WORK}/node-j'
+    os.makedirs(NODE_DIR)
+    node = subprocess.Popen([os.path.join(BIN, 'bitcoind'), '-regtest', f'-datadir={NODE_DIR}', f'-rpcport={RPC}',
+                             '-rpcbind=127.0.0.1', '-rpcallowip=127.0.0.1', '-rpcuser=t', f'-rpcpassword={PW}',
+                             '-listen=0', '-dnsseed=0', '-connect=0', f'-zmqpubrawblock=tcp://127.0.0.1:{ZMQ}',
+                             '-printtoconsole=0', '-fallbackfee=0.0001'])
+    cli('-rpcwait', 'getblockcount')
+    cli('generatetoaddress', '20', burn)
+    os.rename(f'{WORK}/pool/DB', f'{WORK}/pool/DB-cases-E-I'); os.makedirs(f'{WORK}/pool/DB')
+    authority = subprocess.check_output(['node', os.path.join(POOL_SRC, 'scripts', 'sv2-keygen.js'), f'{WORK}/sv2-authority.key'],
+                                        text=True).strip().splitlines()[-1]
+    write_env(fee_addr, sv2=True); start_pool()
+    for _ in range(60):
+        try:
+            socket.create_connection(('127.0.0.1', SV2)).close(); break
+        except OSError:
+            time.sleep(1)
+    ok('J setup: SV2 listener up, authority key loaded', f'Stratum V2: authority public key {authority}' in open(f'{WORK}/pool.log').read())
+
+    def sv2_mine(addr, channel):
+        """An SV2 miner connects now and finds a block on a new tip. Returns (result, hash, height before)."""
+        cli('generatetoaddress', '1', burn)  # new template -> payouts from the current snapshot
+        tip = cli('getbestblockhash')
+        before = int(cli('getblockcount'))
+        r = subprocess.run(['node', os.path.join(POOL_SRC, 'scripts', 'sv2-test-miner.js'), '--dist', f'{WORK}/pool/dist',
+                            '--port', str(SV2), '--authority', authority, '--user', addr + '.w', '--channel', channel, '--tip', tip],
+                           capture_output=True, text=True, timeout=60)
+        try:
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            out = {'result': 'no-output', 'stderr': r.stderr[-300:]}
+        return out, before
+
+    A, B, C = Miner(alice), Miner(bob), Miner(carol)
+    for m, n in ((A, 3), (B, 2), (C, 1)):
+        job = m.latest_job()
+        for _ in range(n):
+            assert m.submit(job, *m.solve(job, False)[:3]) == 'ok'
+    ok('J setup: V1 window 3:2:1', wait_snapshot(time.time(), 3))
+
+    # J1: SV2 STANDARD channel, newcomer finds a block
+    window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
+    out, before = sv2_mine(sam, 'standard')
+    ok('J1: SV2 standard channel: block submitted and accepted', out['result'] == 'ok', json.dumps(out))
+    got, parts, reward = check_block('J1 SV2 standard finds a block', sam, fee_addr, 112_500_000, 10_000, window,
+                                     'ok' if out['result'] == 'ok' else out['result'], out.get('blockHash'), before)
+    ok('J1: reward is 50 BTC', reward == 5_000_000_000, f'{reward}')
+    ok('J1: finder gets the 1.125 BTC Splash Bonus (+ rounding only, no split as a newcomer)',
+       112_500_000 <= got[sam] <= 112_500_000 + 3, f'{got[sam]}')
+    ok('J1: fee is 0.125% of the shared part only', got[fee_addr] == (reward - 112_500_000) * 1250 // 1_000_000, f'fee={got[fee_addr]}')
+    ok('J1: the V1 miners split the rest 3:2:1', got[alice] + got[bob] + got[carol] + got[sam] - 112_500_000 == parts['pool']
+       and abs(got[alice] / got[carol] - 3) < 1e-6 and abs(got[bob] / got[carol] - 2) < 1e-6)
+
+    # J2: V1 newcomer (suggest_difficulty 1) finds a block
+    ok('J2 setup: snapshot has the SV2 finder too', wait_snapshot(time.time(), 4))
+    V = Miner(vic, suggest=1)
+    got, parts, reward = mine_case('J2 V1 newcomer finds a block', V, [V], fee_addr, 112_500_000, 10_000, burn)
+    ok('J2: the SV2 miner\'s block share earned a split, like any share', got.get(sam, 0) > 0)
+
+    # J3: SV2 EXTENDED channel, newcomer finds a block
+    ok('J3 setup: snapshot has both block finders', wait_snapshot(time.time(), 5))
+    window = {w['address']: w['difficulty'] for w in api('/api/splash/window')['miners']}
+    ok('J3: an SV2 block share and a V1 block share are credited the same work', window[sam] == window[vic] > 0,
+       f'sv2={window[sam]} v1={window[vic]}')
+    out, before = sv2_mine(xena, 'extended')
+    ok('J3: SV2 extended channel: block submitted and accepted', out['result'] == 'ok', json.dumps(out))
+    got, parts, reward = check_block('J3 SV2 extended finds a block', xena, fee_addr, 112_500_000, 10_000, window,
+                                     'ok' if out['result'] == 'ok' else out['result'], out.get('blockHash'), before)
+    ok('J3: finder gets the 1.125 BTC Splash Bonus (+ rounding only)', 112_500_000 <= got[xena] <= 112_500_000 + 5, f'{got[xena]}')
+    ok('J3: fee is 0.125% of the shared part only', got[fee_addr] == (reward - 112_500_000) * 1250 // 1_000_000, f'fee={got[fee_addr]}')
+    ok('J3: same shares, same split: SV2 miner paid exactly what the V1 miner is', got[sam] == got[vic] > 0, f'sv2={got[sam]} v1={got[vic]}')
+    log = open(f'{WORK}/pool.log').read()
+    ok('J: both channel types opened with the (SV2) user agent',
+       'type=standard' in log and 'type=extended' in log and 'agent=splash-regtest/sv2-test-miner (SV2)' in log)
+    ok('J: connection log lines mark the protocol', log.count('proto=sv2 channel=standard') >= 1 and log.count('proto=sv2 channel=extended') >= 1)
 
     ok('pool still running', pool.poll() is None)
 finally:
