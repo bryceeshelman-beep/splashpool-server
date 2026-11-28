@@ -148,6 +148,20 @@ All dates are UTC.
   test vectors are unchanged (BSD-3-Clause). See `src/sv2/testdata/README.md`.
 - Not included: Job Declaration, Template Distribution, group channels.
 
+**2026-11-27, later**
+- Worker names from proxies: extension negotiation (0x0001) and the
+  worker-specific hashrate tracking extension (0x0002). A proxy such as the
+  SRI Translator sends each miner's name with its shares, and that miner shows
+  up as its own `address.worker`.
+- Channel limits are settings: `SV2_MAX_CHANNELS_PER_CONNECTION` (256) and
+  `SV2_MAX_CHANNELS_PER_IP` (1024).
+- A connection that has finished SetupConnection may wait
+  `SV2_IDLE_AFTER_SETUP_SECONDS` (1800) for its first channel, so an idle proxy
+  is not dropped after 30 s.
+- A new miner gets its first job at once, even when no new template has
+  arrived. SV2 jobs are sent one at a time per channel, so a new block gives
+  exactly one SetNewPrevHash.
+
 ## Tools and docs
 
 - **2026-11-19**: `scripts/check-coinbase.py` connects as a miner, decodes the

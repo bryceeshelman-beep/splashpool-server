@@ -84,3 +84,6 @@ Save and restart. In the pool's log the worker shows up as
 Miners that only speak V1 can reach the SV2 port through the SRI Translator
 Proxy (stratum-mining/sv2-apps, `translator_sv2`), with `aggregate_channels =
 false` so each miner is its own `address.worker`. It opens Extended channels.
+Set `supported_extensions = [0x0002]` (and `required_extensions = [0x0002]`)
+so the proxy sends each miner's worker name with its shares. An idle proxy
+with no miners may stay connected for `SV2_IDLE_AFTER_SETUP_SECONDS` (30 min).
